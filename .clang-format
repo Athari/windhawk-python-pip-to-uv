@@ -1,0 +1,10 @@
+# To override, create a .clang-format.windhawk file with the desired settings.
+BasedOnStyle: Chromium
+IndentWidth: 4
+CommentPragmas: ^[ \t]+@[a-zA-Z]+
+
+ColumnLimit: 140
+AlignAfterOpenBracket: false
+BinPackArguments: true
+BinPackParameters: BinPack
+BreakFunctionDefinitionParameters: false

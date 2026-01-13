@@ -1,0 +1,9 @@
+{
+    "workbench.editor.showTabs": "multiple",
+    "workbench.statusBar.visible": true,
+    "workbench.activityBar.location": "default",
+    "windhawk.editedModId": "python-pip-to-uv",
+    "windhawk.editedModWasModified": true,
+    "git.enabled": true,
+    "C_Cpp.clang_format_fallbackStyle": "{ BasedOnStyle: WebKit, ColumnLimit: 140 }",
+}
