@@ -35,7 +35,7 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 ## Configuration
 
 * The mod will try to use Python-specific `uv` when available, but will fall back to global `uv`, if it exists. Hint: run `winget install astral-sh.uv`.
-* If you like living on the edge, you can add `cmd.exe`, `pwsh.exe` and `powershell.exe` to the list of included processes. This way, even if you type `pip install` into your favorite terminal, the mod will translate the command for you. However, if your system ends up crashing because it can't run something due to a bug in the mod, don't tell me I haven't warn you.
+* If you like living on the edge, you can add `cmd.exe`, `pwsh.exe` and `powershell.exe` to the list of included processes. This way, even if you type `pip install` into your favorite terminal, the mod will translate the command for you. However, if your system ends up crashing because it can't run something due to a bug in the mod, don't tell me I haven't warned you.
 
 ## Troubleshooting
 
@@ -81,8 +81,10 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
     $description: When enabled, respects --symlinks and --copies arguments passed to venv
   $name: Uv link mode
 - debug:
-  - logLevel: debug
+  - logLevel: info
     $options:
+    - error: Error
+    - warn: Warning
     - info: Info
     - debug: Debug
     - trace: Trace
@@ -92,6 +94,9 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 */
 // ==/WindhawkModSettings==
 
+#pragma clang diagnostic ignored "-Wunqualified-std-cast-call" // WHY U NO WORK TIDY???
+
+#include <cstdint>
 #include <exception>
 #include <cwchar>
 #include <stdexcept>
@@ -110,25 +115,42 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 #include <wil/filesystem.h>
 #include <wil/win32_helpers.h>
 
-#include "windhawk_api.h"
+#include <windhawk_api.h>
 
 using namespace std;
 using namespace wil;
+
+const size_t MAX_LOG_STR = 160;
 
 wstring string_to_wstring(const string& s, UINT cp = CP_ACP)
 {
     if (s.empty())
         return L"";
     int len = MultiByteToWideChar(cp, 0, s.c_str(), s.size(), nullptr, 0);
-    wstring result(L'\0', len);
+    wstring result(len, L'\0');
     MultiByteToWideChar(cp, 0, s.c_str(), s.size(), result.data(), len);
     return result;
 }
 
 bool wcsempty(LPCWSTR s) { return s == nullptr || s[0] == '\0'; }
 bool wcsequals(LPCWSTR s1, LPCWSTR s2) { return wcscmp(s1, s2) == 0; }
-bool wcsstarts(LPCWSTR s, LPCWSTR with) { return wcsncmp(s, with, wcslen(with)) == 0; }
-bool wcsistarts(LPCWSTR s, LPCWSTR with) { return wcsnicmp(s, with, wcslen(with)) == 0; }
+bool wcsiequals(LPCWSTR s1, LPCWSTR s2) { return wcsicmp(s1, s2) == 0; }
+bool wcsstarts(LPCWSTR s, LPCWSTR with) {
+    size_t wlen = wcslen(with);
+    return wcslen(s) >= wlen && wcsncmp(s, with, wlen) == 0;
+}
+bool wcsistarts(LPCWSTR s, LPCWSTR with) {
+    size_t wlen = wcslen(with);
+    return wcslen(s) >= wlen && wcsnicmp(s, with, wlen) == 0;
+}
+bool wcsends(LPCWSTR s, LPCWSTR with) {
+    size_t slen = wcslen(s), wlen = wcslen(with);
+    return slen >= wlen && wcsncmp(s + slen - wlen, with, wlen) == 0;
+}
+bool wcsiends(LPCWSTR s, LPCWSTR with) {
+    size_t slen = wcslen(s), wlen = wcslen(with);
+    return slen >= wlen && wcsnicmp(s + slen - wlen, with, wlen) == 0;
+}
 
 LPCWSTR repr(LPCWSTR s) { return s != nullptr ? s : L"(null)"; }
 
@@ -140,6 +162,17 @@ wstring Wh_GetStdStringSetting(PCWSTR valueName) {
     return result;
 }
 
+bool Wh_GetBoolSetting(PCWSTR valueName) {
+    return Wh_GetIntSetting(valueName) != 0;
+}
+
+wstring PathGetDirNameW(LPCWSTR path) {
+    wstring dir = path;
+    PathRemoveFileSpecW(dir.data());
+    dir.resize(wcslen(dir.c_str()));
+    return dir;
+}
+
 HRESULT CommandLineToArgvW(LPCWSTR lpCmdLine, unique_hlocal_array_ptr<LPCWSTR>& result) WI_NOEXCEPT {
     int numArgs = 0;
     auto lpCommandLineArgs = ::CommandLineToArgvW(lpCmdLine, &numArgs);
@@ -148,7 +181,7 @@ HRESULT CommandLineToArgvW(LPCWSTR lpCmdLine, unique_hlocal_array_ptr<LPCWSTR>& 
     return S_OK;
 }
 
-template<typename string_type, size_t length = 256>
+template<typename string_type, size_t length = MAX_PATH>
 HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, string_type& result) WI_NOEXCEPT
 {
     wstring expandedName;
@@ -158,20 +191,6 @@ HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, 
     RETURN_IF_FAILED(searchResult);
     return S_OK;
 }
-
-template<typename Fn, typename Fail>
-auto Attempt(const wstring& name, Fail&& fail, Fn&& fn) noexcept {
-    try {
-        return invoke(forward<Fn>(fn));
-    } catch (const exception& ex) {
-        Wh_Log(L"%s failed: %s", name.c_str(), string_to_wstring(ex.what()).c_str());
-    } catch (...) {
-        Wh_Log(L"%s failed: %s", name.c_str(), L"unknown exception");
-    }
-    return invoke(forward<Fail>(fail));
-}
-
-void DoNothing() {}
 
 struct option_t {
     bool isSkipped = false;
@@ -230,13 +249,14 @@ const auto pipCommands = unordered_map<wstring, command_t> {
     { L"wheel",      command_t::unsupported }, // https://github.com/astral-sh/uv/issues/1681
 };
 
-enum class command_name_t {
+enum class command_name_t : uint8_t {
     unknown,
     pip,
     venv,
+    virtualenv,
 };
 
-enum class log_level_t {
+enum class log_level_t : uint8_t {
     error,
     warn,
     info,
@@ -244,23 +264,47 @@ enum class log_level_t {
     trace,
 };
 
+const auto logLevels = unordered_map<wstring, log_level_t> {
+    { L"error", log_level_t::error },
+    { L"warn",  log_level_t::warn },
+    { L"info",  log_level_t::info },
+    { L"debug", log_level_t::debug },
+    { L"trace", log_level_t::trace },
+};
+
 struct {
-    wstring uvPath;
-    wstring cmdPath;
-    wstring envPath;
+    wstring defaultUvPath;
 } sys;
 
 struct {
-    bool replacePip;
-    bool replacePythonPip;
-    bool replacePythonVenv;
+    bool replacePip = true;
+    bool replacePythonPip = true;
+    bool replacePythonVenv = true;
+    bool replacePythonVirtualEnv = true;
     wstring uvPath;
     wstring uvCacheDir;
-    bool respectCacheDirArg;
+    bool respectCacheDirArg = false;
     wstring uvLinkMode;
-    bool respectLinkModeArg;
-    log_level_t logLevel;
+    bool respectLinkModeArg = false;
+    log_level_t logLevel = log_level_t::info;
 } settings;
+
+template<typename Fn, typename Fail>
+requires is_nothrow_invocable_v<Fail>
+auto Attempt(const wstring& name, Fail&& fail, Fn&& fn) noexcept {
+    try {
+        return invoke(forward<Fn>(fn));
+    } catch (const exception& ex) {
+        if (settings.logLevel >= log_level_t::error)
+            Wh_Log(L"%s failed: %s", name.c_str(), string_to_wstring(ex.what()).c_str());
+    } catch (...) {
+        if (settings.logLevel >= log_level_t::error)
+            Wh_Log(L"%s failed: %s", name.c_str(), L"unknown exception");
+    }
+    return invoke(forward<Fail>(fail));
+}
+
+void DoNothing() noexcept {}
 
 HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, const wstring& pythonPath, vector<wstring>& outArgs) {
     vector<wstring> otherArgs {};
@@ -285,12 +329,12 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
                 otherArgs.append_range(array { arg, args[iArg + 1] });
                 iArg++;
             } else {
-                otherArgs.push_back(arg);
+                otherArgs.emplace_back(arg);
             }
         } else {
             if (pipCommand.empty())
                 pipCommand = arg;
-            otherArgs.push_back(arg);
+            otherArgs.emplace_back(arg);
         }
     }
 
@@ -301,7 +345,7 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
     if (!settings.uvCacheDir.empty() && !isCacheDirSet)
         outArgs.append_range(array { wstring(L"--cache-dir"), settings.uvCacheDir });
 
-    outArgs.push_back(L"pip");
+    outArgs.emplace_back(L"pip");
     outArgs.append_range(otherArgs);
 
     if (!pipCommand.empty())
@@ -312,7 +356,13 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
     return S_OK;
 }
 
+// NOLINTNEXTLINE - TODO
 bool translateVenvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
+    return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+}
+
+// NOLINTNEXTLINE - TODO
+bool translateVirtualEnvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
     return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 }
 
@@ -332,12 +382,13 @@ BOOL WINAPI CreateProcessW_Hook(
     //     return FALSE;
     // };
 
-    auto bypass = [&](LPCWSTR reason) {
+    auto bypass = [&](LPCWSTR reason) noexcept -> BOOL {
         if (bypassed)
-            throw runtime_error("double bypass");
+            return FALSE;
         bypassed = true;
 
-        Wh_Log(L"-> CreateProcessW (/* original */) reason: %s", reason);
+        if (settings.logLevel >= log_level_t::info)
+            Wh_Log(L"-> CreateProcessW (/* original */) reason: %s", reason);
         // return fail();
         return CreateProcessW_Original(
             lpApplicationName, lpCommandLine,
@@ -345,11 +396,12 @@ BOOL WINAPI CreateProcessW_Hook(
             lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     };
 
-    return Attempt(L"CreateProcessW_Hook", [&]() { return bypass(L"exception"); }, [&]() -> BOOL {
+    return Attempt(L"CreateProcessW_Hook", [&]() noexcept { return bypass(L"exception"); }, [&]() -> BOOL {
         // Init
 
-        Wh_Log(L"<- CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
-            repr(lpApplicationName), repr(lpCommandLine), repr(lpCurrentDirectory));
+        if (settings.logLevel >= log_level_t::info)
+            Wh_Log(L"<- CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
+                repr(lpApplicationName), repr(lpCommandLine), repr(lpCurrentDirectory));
 
         if (!settings.replacePip && !settings.replacePythonPip && !settings.replacePythonVenv)
             return bypass(L"disabled in settings");
@@ -377,17 +429,18 @@ BOOL WINAPI CreateProcessW_Hook(
         auto searchPath =  currentDir + L";" + envPath;
 
         if (settings.logLevel >= log_level_t::trace)
-            Wh_Log(L"  path = %s...", searchPath.substr(0, min(static_cast<size_t>(160), searchPath.size())).c_str());
+            Wh_Log(L"  path = %s...", searchPath.substr(0, min(MAX_LOG_STR, searchPath.size())).c_str());
 
         wstring exePath;
         if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[0], L".exe", exePath)))
             return bypass(format(L"SearchPathW({}) failed", args[0]).c_str());
 
         auto exeName = PathFindFileNameW(exePath.c_str());
-        auto iArg = 1u;
+        auto iArg = 1U;
         auto command = command_name_t::unknown;
 
         if (wcsistarts(exeName, L"cmd.exe") && args.size() > iArg + 1 && wcsistarts(args[iArg], L"/c")) {
+            // cmd.exe /c ...
             // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), args[iArg + 1], L".exe");
             if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[iArg + 1], L".exe", exePath)))
                 return bypass(format(L"SearchPathW({}) failed", args[iArg + 1]).c_str());
@@ -400,28 +453,55 @@ BOOL WINAPI CreateProcessW_Hook(
 
         // Find python command (pip/venv)
 
+        #define SET_COMMAND_NAME(setting, commandName) \
+            do { \
+                if (!settings.setting) \
+                    return bypass(L"settings." L ## #setting L" = false"); \
+                command = command_name_t::commandName; \
+            } while (0)
+
         wstring pythonPath;
-        if (wcsistarts(exeName, L"pip")) {
-            if (!settings.replacePip)
-                return bypass(L"settings.replacePip = false");
-            // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), pythonName, L".exe");
+        if ((wcsistarts(exeName, L"pip") || wcsistarts(exeName, L"virtualenv")) && wcsiends(exeName, L".exe")) {
             if (FAILED(SearchPathW(searchPath.c_str(), L"python.exe", nullptr, pythonPath)))
                 return bypass(format(L"SearchPathW({}) failed", L"python").c_str());
-            command = command_name_t::pip;
+            if (wcsistarts(exeName, L"pip"))
+                SET_COMMAND_NAME(replacePip, pip); // ... pip.exe ...
+            else if (wcsistarts(exeName, L"virtualenv"))
+                SET_COMMAND_NAME(replacePip, pip); // ... virtualenv.exe ...
+            else
+                return bypass(L"unknown module.exe");
             iArg += 1;
-        } else if (wcsistarts(exeName, L"python") && args.size() > iArg + 1 && wcsequals(args[iArg], L"-m")) {
+        } else if (wcsistarts(exeName, L"python")) {
             pythonPath = exePath;
-            if (wcsequals(args[iArg + 1], L"pip")) {
-                if (!settings.replacePythonPip)
-                    return bypass(L"settings.replacePythonPip = false");
-                command = command_name_t::pip;
-            } else if (wcsequals(args[iArg + 1], L"venv")) {
-                if (!settings.replacePythonVenv)
-                    return bypass(L"settings.replacePythonVenv = false");
-                command = command_name_t::venv;
+            wstring pythonDir = PathGetDirNameW(pythonPath.c_str());
+            searchPath =  currentDir + L";" + pythonDir + L";" + pythonDir + L"\\Scripts;" + envPath;
+
+            if (args.size() > iArg + 1 && wcsequals(args[iArg], L"-m")) {
+                if (wcsequals(args[iArg + 1], L"pip"))
+                    SET_COMMAND_NAME(replacePythonPip, pip); // ... python.exe -m pip ...
+                else if (wcsequals(args[iArg + 1], L"venv"))
+                    SET_COMMAND_NAME(replacePythonVenv, venv); // ... python.exe -m venv ...
+                else if (wcsequals(args[iArg + 1], L"virtualenv"))
+                    SET_COMMAND_NAME(replacePythonVirtualEnv, virtualenv); // ... python.exe -m virtualenv ...
+                else
+                    return bypass(L"unknown python -m module");
+                iArg += 2;
+            } else {
+                wstring scriptPath;
+                if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[iArg], L".exe", scriptPath)))
+                    return bypass(format(L"SearchPathW({}) failed", args[iArg]).c_str());
+                auto scriptName = PathFindFileNameW(scriptPath.c_str());
+                if (wcsistarts(scriptName, L"pip") && wcsiends(scriptName, L".exe"))
+                    SET_COMMAND_NAME(replacePythonPip, pip); // ... python.exe scripts/pip.exe ...
+                else if (wcsistarts(scriptName, L"virtualenv") && wcsiends(scriptName, L".exe"))
+                    SET_COMMAND_NAME(replacePythonVirtualEnv, virtualenv); // ... python.exe scripts/virtualenv.exe ...
+                else
+                    return bypass(L"unknown python module.exe");
+                iArg++;
             }
-            iArg += 2;
         }
+
+        #undef SET_COMMAND_NAME
 
         if (settings.logLevel >= log_level_t::trace)
             Wh_Log(L"  python = %s [%d@%d]", pythonPath.c_str(), command, iArg);
@@ -431,17 +511,14 @@ BOOL WINAPI CreateProcessW_Hook(
 
         // Find uv
 
-        wstring pythonDir = pythonPath;
-        PathRemoveFileSpecW(pythonDir.data());
-        pythonDir.resize(wcslen(pythonDir.c_str()));
-        searchPath =  currentDir + L";" + pythonDir + L";" + pythonDir + L"\\Scripts;" + envPath;
-
         if (settings.logLevel >= log_level_t::trace)
-            Wh_Log(L"  path = %s...", searchPath.substr(0, min(static_cast<size_t>(160), searchPath.size())).c_str());
+            Wh_Log(L"  path = %s...", searchPath.substr(0, min(MAX_LOG_STR, searchPath.size())).c_str());
 
         wstring uvPath;
         if (FAILED(SearchPathW(searchPath.c_str(), L"uv.exe", nullptr, uvPath)))
-            uvPath = sys.uvPath;
+            uvPath = sys.defaultUvPath;
+        if (uvPath.empty())
+            return bypass(L"failed to find uv");
 
         if (settings.logLevel >= log_level_t::trace)
             Wh_Log(L"  uv = %s", uvPath.c_str());
@@ -460,6 +537,11 @@ BOOL WINAPI CreateProcessW_Hook(
         } else if (command == command_name_t::venv) {
             if (FAILED(translateVenvArgs(args, iArg, outArgs)))
                 return bypass(L"uv venv command not supported");
+        } else if (command == command_name_t::virtualenv) {
+            if (FAILED(translateVirtualEnvArgs(args, iArg, outArgs)))
+                return bypass(L"uv virtualenv command not supported");
+        } else {
+            throw runtime_error("unexpected command");
         }
 
         if (settings.logLevel >= log_level_t::trace)
@@ -470,8 +552,9 @@ BOOL WINAPI CreateProcessW_Hook(
 
         auto newApplicationName = outArgs[0];
         auto newCommandLine = ArgvToCommandLine<vector<wstring>&, wchar_t>(outArgs);
-        Wh_Log(L"-> CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
-            repr(newApplicationName.c_str()), repr(newCommandLine.data()), repr(lpCurrentDirectory));
+        if (settings.logLevel >= log_level_t::info)
+            Wh_Log(L"-> CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
+                repr(newApplicationName.c_str()), repr(newCommandLine.data()), repr(lpCurrentDirectory));
 
         // return fail();
         return CreateProcessW_Original(
@@ -484,53 +567,51 @@ BOOL WINAPI CreateProcessW_Hook(
         // uv venv [OPTIONS] [NAME]
         // * exact matches: --prompt, --system-site-packages
         // * depends on settings: --symlinks, --copies
-
-        // lpCommandLine:
-        // C:\WINDOWS\system32\cmd.exe /c python -m pip --version
-        // C:\Apps\Python\Python312\python.exe -m pip --version
-        // C:\WINDOWS\system32\cmd.exe /c python -m pip --version
-        // C:\Apps\Python\Python312\python.exe -m pip --version
-        // "C:\Apps\Python\Python312\python.exe" "C:\Apps\Python\Python312\Scripts\pip.exe" --version <<<<<<<<<<<<<< TODO
-        // "C:\Apps\Python\Python312\Scripts\pip.exe" --version
     });
 }
 
+wstring FindGlobalUvPath() {
+    wstring uvPath;
+    ([&]() -> HRESULT {
+        auto envPath = GetEnvironmentVariableW<wstring>(L"PATH");
+        if (settings.uvPath.empty()) {
+            RETURN_IF_FAILED(SearchPathW(envPath.c_str(), L"uv.exe", nullptr, sys.defaultUvPath));
+        } else {
+            auto expandedUvPath = ExpandEnvironmentStringsW(settings.uvPath.c_str());
+            auto attr = GetFileAttributes(expandedUvPath.get());
+            if (attr & FILE_ATTRIBUTE_DIRECTORY)
+                RETURN_IF_FAILED(SearchPathW(expandedUvPath.get(), L"uv.exe", nullptr, sys.defaultUvPath));
+            else
+                RETURN_IF_FAILED(SearchPathW(envPath.c_str(), expandedUvPath.get(), L".exe", sys.defaultUvPath));
+        }
+        return S_OK;
+    })();
+    return uvPath;
+}
+
 void LoadSettings() {
-    settings.replacePip = Wh_GetIntSetting(L"replacePip");
-    settings.replacePythonPip = Wh_GetIntSetting(L"replacePythonPip");
-    settings.replacePythonVenv = Wh_GetIntSetting(L"replacePythonVenv");
+    settings.replacePip = Wh_GetBoolSetting(L"replacePip");
+    settings.replacePythonPip = Wh_GetBoolSetting(L"replacePythonPip");
+    settings.replacePythonVenv = Wh_GetBoolSetting(L"replacePythonVenv");
     settings.uvPath = Wh_GetStdStringSetting(L"uvPath");
     settings.uvCacheDir = Wh_GetStdStringSetting(L"uvCacheDir.uvCacheDir");
-    settings.respectCacheDirArg = Wh_GetIntSetting(L"uvCacheDir.respectCacheDirArg");
+    settings.respectCacheDirArg = Wh_GetBoolSetting(L"uvCacheDir.respectCacheDirArg");
     settings.uvLinkMode = Wh_GetStdStringSetting(L"uvLinkMode.uvLinkMode");
-    settings.respectLinkModeArg = Wh_GetIntSetting(L"uvLinkMode.respectLinkModeArg");
+    settings.respectLinkModeArg = Wh_GetBoolSetting(L"uvLinkMode.respectLinkModeArg");
     auto logLevel = Wh_GetStdStringSetting(L"debug.logLevel");
-    settings.logLevel = logLevel == L"debug" ? log_level_t::debug : logLevel == L"trace" ? log_level_t::trace : log_level_t::info;
+    settings.logLevel = logLevels.contains(logLevel) ? logLevels.at(logLevel) : log_level_t::info;
 
-    sys.cmdPath = GetEnvironmentVariableW<wstring>(L"ComSpec");
-    sys.envPath = GetEnvironmentVariableW<wstring>(L"PATH");
-
-    // TODO: Make global uv optional
-    if (settings.uvPath.empty()) {
-        THROW_IF_FAILED(SearchPathW(sys.envPath.c_str(), L"uv.exe", nullptr, sys.uvPath));
-    } else {
-        auto expandedUvPath = ExpandEnvironmentStringsW(settings.uvPath.c_str());
-        auto attr = GetFileAttributes(expandedUvPath.get());
-        if (attr & FILE_ATTRIBUTE_DIRECTORY)
-            THROW_IF_FAILED(SearchPathW(expandedUvPath.get(), L"uv.exe", nullptr, sys.uvPath));
-        else
-            THROW_IF_FAILED(SearchPathW(sys.envPath.c_str(), expandedUvPath.get(), L".exe", sys.uvPath));
-    }
-
-    // Wh_Log(L"ComSpec = %s", sys.cmdPath.c_str());
-    // Wh_Log(L"PATH = %s", sys.envPath.c_str());
-    Wh_Log(L"uvPath = %s", sys.uvPath.c_str());
-    // Wh_Log(L"logLevel = %s | %d", logLevel.c_str(), settings.logLevel);
+    sys.defaultUvPath = FindGlobalUvPath();
+    if (settings.logLevel >= log_level_t::info)
+        Wh_Log(L"defaultUvPath = %s", sys.defaultUvPath.c_str());
+    if (settings.logLevel >= log_level_t::debug)
+        Wh_Log(L"logLevel = %s | %d", logLevel.c_str(), settings.logLevel);
 }
 
 BOOL Wh_ModInit() {
-    return Attempt(L"ModInit", []() { return FALSE; }, []() {
-        Wh_Log(L"ModInit in %s", GetModuleFileNameW().get());
+    return Attempt(L"ModInit", []() noexcept { return FALSE; }, []() {
+        if (settings.logLevel >= log_level_t::info)
+            Wh_Log(L"ModInit in %s", GetModuleFileNameW().get());
 
         LoadSettings();
 
@@ -539,7 +620,7 @@ BOOL Wh_ModInit() {
         SetResultLoggingCallback([](const FailureInfo& failure) __stdcall noexcept {
             const size_t wilLogMessageSize = 2048;
             wchar_t logMessage[wilLogMessageSize];
-            if (SUCCEEDED(GetFailureLogString(logMessage, wilLogMessageSize, failure)))
+            if (settings.logLevel >= log_level_t::warn && SUCCEEDED(GetFailureLogString(logMessage, wilLogMessageSize, failure)))
                 Wh_Log(L"[wil] %s", logMessage);
         });
         return TRUE;
@@ -548,13 +629,15 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     Attempt(L"ModUninit", DoNothing, []() {
-        Wh_Log(L"ModUninit");
+        if (settings.logLevel >= log_level_t::info)
+            Wh_Log(L"ModUninit");
     });
 }
 
 void Wh_ModSettingsChanged() {
     Attempt(L"ModSettingsChanged", DoNothing, []() {
-        Wh_Log(L"ModSettingsChanged");
+        if (settings.logLevel >= log_level_t::info)
+            Wh_Log(L"ModSettingsChanged");
         LoadSettings();
     });
 }
