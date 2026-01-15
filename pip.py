@@ -11,8 +11,14 @@ import subprocess
 
 # subprocess.run([sys.executable, "-m", "pip", "--version"])
 
-os.environ["PATH"] = os.path.dirname(sys.executable) + ";" + os.environ["PATH"]
+dir = os.path.dirname(sys.executable)
+os.environ["PATH"] = dir + ";" + dir + "/scripts;" + os.environ["PATH"]
 # print(os.environ["PATH"])
+
+os.system("python pip --version")
+os.system("python pip.exe --version")
+os.system("python " + dir + "/scripts/pip --version")
+os.system("python " + dir + "/scripts/pip.exe --version") # only this one works without mod
 
 # os.system("python -m pip --version")
 # os.system("python -m pip --help")
