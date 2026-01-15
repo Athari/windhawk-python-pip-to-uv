@@ -3,7 +3,8 @@
     "workbench.statusBar.visible": true,
     "workbench.activityBar.location": "default",
     "windhawk.editedModId": "python-pip-to-uv",
-    "windhawk.editedModWasModified": true,
+    "windhawk.editedModWasModified": false,
     "git.enabled": true,
-    "C_Cpp.clang_format_fallbackStyle": "{ BasedOnStyle: WebKit, ColumnLimit: 140 }",
+    "clangd.path": "C:/Program Files/Windhawk/Compiler/bin/clangd.exe",
+    "C_Cpp.intelliSenseEngine": "disabled",
 }
