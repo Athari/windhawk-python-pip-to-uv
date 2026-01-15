@@ -3,8 +3,9 @@
     "workbench.statusBar.visible": true,
     "workbench.activityBar.location": "default",
     "windhawk.editedModId": "python-pip-to-uv",
-    "windhawk.editedModWasModified": false,
+    "windhawk.editedModWasModified": true,
     "git.enabled": true,
     "clangd.path": "C:/Program Files/Windhawk/Compiler/bin/clangd.exe",
     "C_Cpp.intelliSenseEngine": "disabled",
+    "python.defaultInterpreterPath": "C:/Apps/Python/Python312/python.exe",
 }

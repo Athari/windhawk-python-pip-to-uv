@@ -64,15 +64,26 @@ Replaces calls to `os.system("python -m pip")` with `os.system("uv")`
     $name: Respect venv arguments
     $description: When enabled, respects --symlinks and --copies arguments passed to venv
   $name: Uv link mode
+- debug:
+  - logLevel: debug
+    $options:
+    - info: Info
+    - debug: Debug
+    - trace: Trace
+    $name: Log level
+    $description: Detail level of logging
+  $name: Debug
 */
 // ==/WindhawkModSettings==
 
 #include <exception>
 #include <cwchar>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <unordered_map>
 
+#include <errhandlingapi.h>
 #include <processenv.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -87,6 +98,64 @@ Replaces calls to `os.system("python -m pip")` with `os.system("uv")`
 
 using namespace std;
 using namespace wil;
+
+wstring string_to_wstring(const string& s, UINT cp = CP_ACP)
+{
+    if (s.empty())
+        return L"";
+    int len = MultiByteToWideChar(cp, 0, s.c_str(), s.size(), nullptr, 0);
+    wstring result(L'\0', len);
+    MultiByteToWideChar(cp, 0, s.c_str(), s.size(), result.data(), len);
+    return result;
+}
+
+bool wcsempty(LPCWSTR s) { return s == nullptr || s[0] == '\0'; }
+bool wcsequals(LPCWSTR s1, LPCWSTR s2) { return wcscmp(s1, s2) == 0; }
+bool wcsstarts(LPCWSTR s, LPCWSTR with) { return wcsncmp(s, with, wcslen(with)) == 0; }
+bool wcsistarts(LPCWSTR s, LPCWSTR with) { return wcsnicmp(s, with, wcslen(with)) == 0; }
+
+LPCWSTR repr(LPCWSTR s) { return s != nullptr ? s : L"(null)"; }
+
+wstring Wh_GetStdStringSetting(PCWSTR valueName) {
+    auto buf = Wh_GetStringSetting(valueName);
+    wstring result;
+    result.append(buf);
+    Wh_FreeStringSetting(buf);
+    return result;
+}
+
+HRESULT CommandLineToArgvW(LPCWSTR lpCmdLine, unique_hlocal_array_ptr<LPCWSTR>& result) WI_NOEXCEPT {
+    int numArgs = 0;
+    auto lpCommandLineArgs = ::CommandLineToArgvW(lpCmdLine, &numArgs);
+    RETURN_LAST_ERROR_IF_NULL(lpCommandLineArgs);
+    result.reset(const_cast<LPCWSTR*>(lpCommandLineArgs), numArgs);
+    return S_OK;
+}
+
+template<typename string_type, size_t length = 256>
+HRESULT ExpandEnvAndSearchPathW(PCWSTR input, PCWSTR extension, string_type& result) WI_NOEXCEPT
+{
+    unique_cotaskmem_string expandedName;
+    RETURN_IF_FAILED((ExpandEnvironmentStringsW<string_type, length>(input, expandedName)));
+    const HRESULT searchResult = (SearchPathW<string_type, length>(nullptr, expandedName.get(), extension, result));
+    RETURN_HR_IF_EXPECTED(searchResult, searchResult == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
+    RETURN_IF_FAILED(searchResult);
+    return S_OK;
+}
+
+template<typename Fn, typename Fail>
+auto Attempt(const wstring& name, Fail&& fail, Fn&& fn) noexcept {
+    try {
+        return invoke(forward<Fn>(fn));
+    } catch (const exception& ex) {
+        Wh_Log(L"%s failed: %s", name.c_str(), string_to_wstring(ex.what()).c_str());
+    } catch (...) {
+        Wh_Log(L"%s failed: %s", name.c_str(), L"unknown exception");
+    }
+    return invoke(forward<Fail>(fail));
+}
+
+void DoNothing() {}
 
 struct option_t {
     bool isSkipped = false;
@@ -106,8 +175,8 @@ const option_t option_t::skipWithArg { .isSkipped = true, .hasArg = true };
 const option_t option_t::command     { .isCommand = true };
 
 struct command_t {
-    bool isSupported = true;
-    bool hasLinkMode = false;
+    bool isSupported = true;  // uv has matching command
+    bool hasLinkMode = false; // --link-mode <LINK_MODE>
     static const command_t unsupported;
     static const command_t supported;
     static const command_t withLinkMode;
@@ -151,6 +220,14 @@ enum class command_name_t {
     venv,
 };
 
+enum class log_level_t {
+    error,
+    warn,
+    info,
+    debug,
+    trace,
+};
+
 struct {
     wstring uvPath;
     wstring cmdPath;
@@ -166,23 +243,24 @@ struct {
     bool respectCacheDirArg;
     wstring uvLinkMode;
     bool respectLinkModeArg;
+    log_level_t logLevel;
 } settings;
 
-HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
+HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, const wstring& pythonPath, vector<wstring>& outArgs) {
     vector<wstring> otherArgs {};
     bool isCacheDirSet;
     wstring pipCommand;
 
     for (; iArg < args.size(); iArg++) {
         auto arg = args[iArg];
-        if (wcscmp(arg, L"--cache-dir") == 0 && args.size() > iArg + 1 && settings.respectCacheDirArg) {
+        if (wcsequals(arg, L"--cache-dir") && args.size() > iArg + 1 && settings.respectCacheDirArg) {
             outArgs.append_range(array { arg, args[iArg + 1] });
             isCacheDirSet = true;
             iArg++;
             continue;
         }
 
-        auto opt = pipOptions.contains(arg) ? pipOptions.at(arg) : wcsncmp(arg, L"-", 1) == 0 ? option_t::simple : option_t::command;
+        auto opt = pipOptions.contains(arg) ? pipOptions.at(arg) : wcsstarts(arg, L"-") ? option_t::simple : option_t::command;
         if (opt.isSkipped) {
             if (opt.hasArg)
                 iArg++;
@@ -200,16 +278,21 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
         }
     }
 
-    auto cmd = pipCommands.contains(pipCommand) ? pipCommands.at(pipCommand) : command_t::unsupported;
+    auto cmd = pipCommands.contains(pipCommand) ? pipCommands.at(pipCommand) : pipCommand.empty() ? command_t::supported : command_t::unsupported;
     if (!cmd.isSupported)
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 
     if (!settings.uvCacheDir.empty() && !isCacheDirSet)
         outArgs.append_range(array { wstring(L"--cache-dir"), settings.uvCacheDir });
+
+    outArgs.push_back(L"pip");
+    outArgs.append_range(otherArgs);
+
+    if (!pipCommand.empty())
+        outArgs.append_range(array { wstring(L"--python"), pythonPath });
     if (!settings.uvLinkMode.empty() && cmd.hasLinkMode)
         outArgs.append_range(array { wstring(L"--link-mode"), settings.uvLinkMode });
 
-    outArgs.append_range(otherArgs);
     return S_OK;
 }
 
@@ -220,195 +303,147 @@ bool translateVenvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, 
 using CreateProcessW_t = decltype(&CreateProcessW);
 CreateProcessW_t CreateProcessW_Original;
 
-wstring string_to_wstring(const string& s, UINT cp = CP_ACP)
-{
-    if (s.empty())
-        return L"";
-    int len = MultiByteToWideChar(cp, 0, s.c_str(), s.size(), nullptr, 0);
-    wstring result(L'\0', len);
-    MultiByteToWideChar(cp, 0, s.c_str(), s.size(), result.data(), len);
-    return result;
-}
-
-LPCWSTR str_repr(LPCWSTR s) {
-    return s != nullptr ? s : L"(null)";
-}
-
-wstring Wh_GetStdStringSetting(PCWSTR valueName) {
-    auto buf = Wh_GetStringSetting(valueName);
-    wstring result;
-    result.append(buf);
-    Wh_FreeStringSetting(buf);
-    return result;
-}
-
-HRESULT CommandLineToArgvW(LPCWSTR lpCmdLine, unique_hlocal_array_ptr<LPCWSTR>& result) WI_NOEXCEPT {
-    int numArgs = 0;
-    auto lpCommandLineArgs = ::CommandLineToArgvW(lpCmdLine, &numArgs);
-    RETURN_LAST_ERROR_IF_NULL(lpCommandLineArgs);
-    result.reset(const_cast<LPCWSTR*>(lpCommandLineArgs), numArgs);
-    return S_OK;
-}
-
-template<typename string_type, size_t length = 256>
-HRESULT ExpandEnvAndSearchPath(PCWSTR input, PCWSTR extension, string_type& result) WI_NOEXCEPT
-{
-    unique_cotaskmem_string expandedName;
-    RETURN_IF_FAILED((ExpandEnvironmentStringsW<string_type, length>(input, expandedName)));
-    const HRESULT searchResult = (SearchPathW<string_type, length>(nullptr, expandedName.get(), extension, result));
-    RETURN_HR_IF_EXPECTED(searchResult, searchResult == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
-    RETURN_IF_FAILED(searchResult);
-    return S_OK;
-}
-
-template<typename Fn, typename Fail>
-auto Attempt(const wstring& name, Fail&& fail, Fn&& fn) noexcept {
-    try {
-        return invoke(forward<Fn>(fn));
-    } catch (const exception& ex) {
-        Wh_Log(L"%s failed: %s", name.c_str(), string_to_wstring(ex.what()).c_str());
-    } catch (...) {
-        Wh_Log(L"%s failed: %s", name.c_str(), L"unknown exception");
-    }
-    return invoke(forward<Fail>(fail));
-    // return invoke_result_t<F1>{};
-}
-
-void DoNothing() {}
-
 BOOL WINAPI CreateProcessW_Hook(
     LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
     LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes,
     BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
     LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation
 ) {
-    auto callOriginal = [&](LPCWSTR reason) {
-        if (reason != nullptr)
-            Wh_Log(L"-> CreateProcessW (/* original */) reason: %s", reason);
+    bool bypassed = false;
+
+    // auto fail = [&]() {
+    //     SetLastError(ERROR_NOT_SUPPORTED);
+    //     return FALSE;
+    // };
+
+    auto bypass = [&](LPCWSTR reason) {
+        if (bypassed)
+            throw runtime_error("double bypass");
+        bypassed = true;
+
+        Wh_Log(L"-> CreateProcessW (/* original */) reason: %s", reason);
+        // return fail();
         return CreateProcessW_Original(
             lpApplicationName, lpCommandLine,
             lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags,
             lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     };
-    return Attempt(L"CreateProcessW_Hook", [&]() { return callOriginal(L"exception"); }, [&]() -> BOOL {
+
+    return Attempt(L"CreateProcessW_Hook", [&]() { return bypass(L"exception"); }, [&]() -> BOOL {
+        // Init
+
         Wh_Log(L"<- CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
-            str_repr(lpApplicationName), str_repr(lpCommandLine), str_repr(lpCurrentDirectory));
+            repr(lpApplicationName), repr(lpCommandLine), repr(lpCurrentDirectory));
+
+        if (!settings.replacePip && !settings.replacePythonPip && !settings.replacePythonVenv)
+            return bypass(L"disabled in settings");
 
         // Parse command line into args
 
-        if (lpCommandLine == nullptr || lpCommandLine[0] == 0)
-            return callOriginal(L"empty command line");
-        if (!settings.replacePip && !settings.replacePythonPip && !settings.replacePythonVenv)
-            return callOriginal(L"disabled in settings");
+        auto commandLine = !wcsempty(lpCommandLine) ? lpCommandLine : lpApplicationName;
+        if (wcsempty(commandLine))
+            return bypass(L"empty command line");
 
         unique_hlocal_array_ptr<LPCWSTR> args;
-        if (FAILED(CommandLineToArgvW(lpCommandLine, args)) || args.empty())
-            return callOriginal(L"CommandLineToArgvW failed");
+        if (FAILED(CommandLineToArgvW(commandLine, args)) || args.empty())
+            return bypass(L"CommandLineToArgvW failed");
         if (args.size() <= 1)
-            return callOriginal(L"command line too short");
+            return bypass(L"command line too short");
 
-        for (size_t i = 0; i < args.size(); i++)
-            Wh_Log(L"  <- arg[%d] = %s", i, args[i]);
+        if (settings.logLevel >= log_level_t::trace)
+            for (size_t i = 0; i < args.size(); i++)
+                Wh_Log(L"  <- arg[%d] = %s", i, args[i]);
 
         // Find main exe path (skip cmd /c)
 
-        auto currentDir = lpCurrentDirectory != nullptr ? wstring(lpCurrentDirectory) :  GetCurrentDirectoryW<wstring>();
-        auto searchPath =  currentDir + L";" + sys.envPath;
+        auto currentDir = !wcsempty(lpCurrentDirectory) ? lpCurrentDirectory :  GetCurrentDirectoryW<wstring>();
+        auto searchPath =  currentDir + L";" + GetEnvironmentVariableW<wstring>(L"PATH");
+
+        if (settings.logLevel >= log_level_t::trace)
+            Wh_Log(L"  path = %s...", searchPath.substr(0, min(static_cast<size_t>(160), searchPath.size())).c_str());
+
         wstring exePath;
-        // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.c_str(), args[0], L".exe");
         if (FAILED(SearchPathW(searchPath.c_str(), args[0], L".exe", exePath)))
-            return callOriginal(L"SearchPathW failed");
+            return bypass(format(L"SearchPathW({}) failed", args[0]).c_str());
 
         auto exeName = PathFindFileNameW(exePath.c_str());
         auto iArg = 1u;
         auto command = command_name_t::unknown;
 
-        if (wcsnicmp(exeName, L"cmd.exe", 7) == 0 && args.size() >= iArg + 2 && wcsnicmp(args[iArg], L"/c", 2) == 0) {
-            iArg += 2;
+        if (wcsistarts(exeName, L"cmd.exe") && args.size() > iArg + 1 && wcsistarts(args[iArg], L"/c")) {
+            // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), args[iArg + 1], L".exe");
             if (FAILED(SearchPathW(searchPath.c_str(), args[iArg + 1], L".exe", exePath)))
-                return callOriginal(L"SearchPathW(cmd) failed");
+                return bypass(format(L"SearchPathW({}) failed", args[iArg + 1]).c_str());
             exeName = PathFindFileNameW(exePath.c_str());
+            iArg += 2;
         }
 
-        Wh_Log(L"  exe = %s [?@%d]", exeName, iArg);
+        if (settings.logLevel >= log_level_t::trace)
+            Wh_Log(L"  exe = %s [?@%d]", exeName, iArg);
 
         // Find python command (pip/venv)
 
-        wstring pythonName;
-        if (wcsnicmp(exeName, L"pip", 3) == 0) {
+        wstring pythonPath;
+        if (wcsistarts(exeName, L"pip")) {
             if (!settings.replacePip)
-                return callOriginal(L"settings.replacePip = false");
+                return bypass(L"settings.replacePip = false");
+            // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), pythonName, L".exe");
+            if (FAILED(SearchPathW(searchPath.c_str(), L"python", L".exe", pythonPath)))
+                return bypass(format(L"SearchPathW({}) failed", L"python").c_str());
             command = command_name_t::pip;
             iArg += 1;
-        } else if (wcsnicmp(exeName, L"python", 6) == 0 && args.size() >= iArg + 2 && wcscmp(args[iArg], L"-m") == 0) {
-            pythonName = exeName;
-            if (wcscmp(args[iArg + 1], L"pip") == 0) {
+        } else if (wcsistarts(exeName, L"python") && args.size() > iArg + 1 && wcsequals(args[iArg], L"-m")) {
+            pythonPath = exePath;
+            if (wcsequals(args[iArg + 1], L"pip")) {
                 if (!settings.replacePythonPip)
-                    return callOriginal(L"settings.replacePythonPip = false");
+                    return bypass(L"settings.replacePythonPip = false");
                 command = command_name_t::pip;
-                iArg += 2;
-            } else if (wcscmp(args[iArg + 1], L"venv") == 0) {
+            } else if (wcsequals(args[iArg + 1], L"venv")) {
                 if (!settings.replacePythonVenv)
-                    return callOriginal(L"settings.replacePythonVenv = false");
+                    return bypass(L"settings.replacePythonVenv = false");
                 command = command_name_t::venv;
-                iArg += 2;
             }
+            iArg += 2;
         }
 
+        if (settings.logLevel >= log_level_t::trace)
+            Wh_Log(L"  python = %s [%d@%d]", pythonPath.c_str(), command, iArg);
+
         if (command == command_name_t::unknown)
-            return callOriginal(L"unrecognized command");
-
-        wstring pythonPath;
-        if (FAILED(SearchPathW(searchPath.c_str(), pythonName.c_str(), L".exe", pythonPath)))
-            return callOriginal(L"SearchPathW(python) failed");
-
-        Wh_Log(L"  python = %s [%d@%d]", pythonPath.c_str(), command, iArg);
+            return bypass(L"unrecognized command");
 
         // Translate arguments
 
         vector<wstring> outArgs {
             sys.uvPath,
             L"--no-python-downloads",
-            L"--python", pythonPath,
+            L"--python-preference", L"only-system",
         };
 
         if (command == command_name_t::pip) {
-            if (FAILED(translatePipArgs(args, iArg, outArgs)))
-                return callOriginal(L"uv pip command not supported");
+            if (FAILED(translatePipArgs(args, iArg, pythonPath, outArgs)))
+                return bypass(L"uv pip command not supported");
         } else if (command == command_name_t::venv) {
             if (FAILED(translateVenvArgs(args, iArg, outArgs)))
-                return callOriginal(L"uv venv command not supported");
+                return bypass(L"uv venv command not supported");
         }
 
-        for (size_t i = 0; i < outArgs.size(); i++)
-            Wh_Log(L"  -> arg[%d] = %s", i, outArgs.at(i).c_str());
+        if (settings.logLevel >= log_level_t::trace)
+            for (size_t i = 0; i < outArgs.size(); i++)
+                Wh_Log(L"  -> arg[%d] = %s", i, outArgs.at(i).c_str());
 
         // Call original CreateProcessW with translated arguments
 
         auto newApplicationName = outArgs[0];
         auto newCommandLine = ArgvToCommandLine<vector<wstring>&, wchar_t>(outArgs);
         Wh_Log(L"-> CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
-            str_repr(newApplicationName.c_str()), str_repr(newCommandLine.data()), str_repr(lpCurrentDirectory));
+            repr(newApplicationName.c_str()), repr(newCommandLine.data()), repr(lpCurrentDirectory));
 
+        // return fail();
         return CreateProcessW_Original(
             newApplicationName.c_str(), newCommandLine.data(),
             lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags,
             lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-
-        // Always use https://github.com/microsoft/wil/wiki/Win32-helpers if possible
-
-        // TODO
-        // * Parse command line - use CommandLineToArgvW (then LocalFree)
-        // * Skip "cmd.exe /c" (/c is case-insensitive) and "python.exe"
-        // * Syntax of "-m pip" is case-sensitive
-        // * Format command line using wil/ArgvToCommandLineW
-        //    * Always add: --no-python-downloads, --python <PYTHON> (specify as full path; drop --python arg from source)
-
-        // TODO pip
-        // python -m pip <command> [options]
-        // uv pip [OPTIONS] <COMMAND>
-        // * has matches:
-        // * depends on settings: --no-cache-dir, --cache-dir
 
         // TODO venv
         // python -m venv [-h] [--system-site-packages] [--symlinks | --copies] [--clear] [--upgrade] [--without-pip] [--prompt PROMPT] [--upgrade-deps] ENV_DIR [ENV_DIR ...]
@@ -421,8 +456,10 @@ BOOL WINAPI CreateProcessW_Hook(
         // C:\Apps\Python\Python312\python.exe -m pip --version
         // C:\WINDOWS\system32\cmd.exe /c python -m pip --version
         // C:\Apps\Python\Python312\python.exe -m pip --version
-        // "C:\Apps\Python\Python312\python.exe" "C:\Apps\Python\Python312\Scripts\pip.exe" --version
+        // "C:\Apps\Python\Python312\python.exe" "C:\Apps\Python\Python312\Scripts\pip.exe" --version <<<<<<<<<<<<<< TODO
         // "C:\Apps\Python\Python312\Scripts\pip.exe" --version
+
+        // TODO: ExpandEnv+SearchPath, not just SearchPath
     });
 }
 
@@ -431,10 +468,12 @@ void LoadSettings() {
     settings.replacePythonPip = Wh_GetIntSetting(L"replacePythonPip");
     settings.replacePythonVenv = Wh_GetIntSetting(L"replacePythonVenv");
     settings.uvPath = Wh_GetStdStringSetting(L"uvPath");
-    settings.uvCacheDir = Wh_GetStdStringSetting(L"uvCacheDir");
-    settings.respectCacheDirArg = Wh_GetIntSetting(L"respectCacheDirArg");
-    settings.uvLinkMode = Wh_GetStdStringSetting(L"uvLinkMode");
-    settings.respectLinkModeArg = Wh_GetIntSetting(L"respectLinkModeArg");
+    settings.uvCacheDir = Wh_GetStdStringSetting(L"uvCacheDir.uvCacheDir");
+    settings.respectCacheDirArg = Wh_GetIntSetting(L"uvCacheDir.respectCacheDirArg");
+    settings.uvLinkMode = Wh_GetStdStringSetting(L"uvLinkMode.uvLinkMode");
+    settings.respectLinkModeArg = Wh_GetIntSetting(L"uvLinkMode.respectLinkModeArg");
+    auto logLevel = Wh_GetStdStringSetting(L"debug.logLevel");
+    settings.logLevel = logLevel == L"debug" ? log_level_t::debug : logLevel == L"trace" ? log_level_t::trace : log_level_t::info;
 
     sys.cmdPath = GetEnvironmentVariableW<wstring>(L"ComSpec");
     sys.envPath = GetEnvironmentVariableW<wstring>(L"PATH");
@@ -452,7 +491,8 @@ void LoadSettings() {
 
     // Wh_Log(L"ComSpec = %s", sys.cmdPath.c_str());
     // Wh_Log(L"PATH = %s", sys.envPath.c_str());
-    Wh_Log(L"UV = %s", sys.uvPath.c_str());
+    Wh_Log(L"uvPath = %s", sys.uvPath.c_str());
+    // Wh_Log(L"logLevel = %s | %d", logLevel.c_str(), settings.logLevel);
 }
 
 BOOL Wh_ModInit() {
