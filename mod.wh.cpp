@@ -19,12 +19,28 @@
 /*
 # Replace Python Pip with UV
 
-Replaces calls to `os.system("python -m pip")` with `os.system("uv")`
+Replaces calls to `os.system("python -m pip")` with `os.system("uv pip")` and the like by hooking `CreateProcessW` in `python*.exe` and `pip*.exe`.
 
-# Getting started
+The primary purpose of this mod is to enforce uv's caching and performance onto every script and app that run on the system, no matter what the developers of those scripts and apps think about the unfathomable complexity of migrating to uv and your desire to nuke pip from high orbit.
 
-* [Docs](https://github.com/ramensoftware/windhawk/wiki/Creating-a-new-mod)
-* [Article](https://kylehalladay.com/blog/2020/11/13/Hooking-By-Example.html)
+## Features
+
+* Handles all ways of running pip: `pip`, `python -m pip`, `cmd /c python -m pip`, `python scripts\pip.exe`.
+* Handles all modules which end up calling `CreateProcessW`: `os.system`, `subprocess.run` etc.
+* Handles all python processes, including installed manually, managed by uv, bundled with electron apps etc.
+* Handles `cache-dir` and `link-mode` options of `uv` and allows overriding them via settings and/or arguments.
+
+The mod *does not* handle `pip` any better than `uv` — it just blindly replaces arguments, as long as the `uv pip` subcommand is supported. Unsupported subcommands fall back to running `pip`. Notably, these include `download` and `wheel`, which haven't been implemented in `uv` yet.
+
+## Configuration
+
+* The mod will try to use Python-specific `uv` when available, but will fall back to global `uv`, if it exists. Hint: run `winget install astral-sh.uv`.
+* If you like living on the edge, you can add `cmd.exe`, `pwsh.exe` and `powershell.exe` to the list of included processes. This way, even if you type `pip install` into your favorite terminal, the mod will translate the command for you. However, if your system ends up crashing because it can't run something due to a bug in the mod, don't tell me I haven't warn you.
+
+## Troubleshooting
+
+* If something goes wrong, enable trace logs in the mod settings. It'll tell you what executables get resolved to what, what paths are searched and how arguments were transformed.
+* If you end up with 500 python processes due to a bug in the mod, the command line you're looking for is `taskkill /im python.exe /f /t` (you may need to run it a few times in rapid sucession). I haven't seen that bug in a while, but just in case.
 */
 // ==/WindhawkModReadme==
 
@@ -133,11 +149,11 @@ HRESULT CommandLineToArgvW(LPCWSTR lpCmdLine, unique_hlocal_array_ptr<LPCWSTR>& 
 }
 
 template<typename string_type, size_t length = 256>
-HRESULT ExpandEnvAndSearchPathW(PCWSTR input, PCWSTR extension, string_type& result) WI_NOEXCEPT
+HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, string_type& result) WI_NOEXCEPT
 {
-    unique_cotaskmem_string expandedName;
-    RETURN_IF_FAILED((ExpandEnvironmentStringsW<string_type, length>(input, expandedName)));
-    const HRESULT searchResult = (SearchPathW<string_type, length>(nullptr, expandedName.get(), extension, result));
+    wstring expandedName;
+    RETURN_IF_FAILED((ExpandEnvironmentStringsW<string_type, length>(fileName, expandedName)));
+    const HRESULT searchResult = (SearchPathW<string_type, length>(path, expandedName.c_str(), extension, result));
     RETURN_HR_IF_EXPECTED(searchResult, searchResult == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
     RETURN_IF_FAILED(searchResult);
     return S_OK;
@@ -356,14 +372,15 @@ BOOL WINAPI CreateProcessW_Hook(
 
         // Find main exe path (skip cmd /c)
 
+        auto envPath = GetEnvironmentVariableW<wstring>(L"PATH");
         auto currentDir = !wcsempty(lpCurrentDirectory) ? lpCurrentDirectory :  GetCurrentDirectoryW<wstring>();
-        auto searchPath =  currentDir + L";" + GetEnvironmentVariableW<wstring>(L"PATH");
+        auto searchPath =  currentDir + L";" + envPath;
 
         if (settings.logLevel >= log_level_t::trace)
             Wh_Log(L"  path = %s...", searchPath.substr(0, min(static_cast<size_t>(160), searchPath.size())).c_str());
 
         wstring exePath;
-        if (FAILED(SearchPathW(searchPath.c_str(), args[0], L".exe", exePath)))
+        if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[0], L".exe", exePath)))
             return bypass(format(L"SearchPathW({}) failed", args[0]).c_str());
 
         auto exeName = PathFindFileNameW(exePath.c_str());
@@ -372,14 +389,14 @@ BOOL WINAPI CreateProcessW_Hook(
 
         if (wcsistarts(exeName, L"cmd.exe") && args.size() > iArg + 1 && wcsistarts(args[iArg], L"/c")) {
             // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), args[iArg + 1], L".exe");
-            if (FAILED(SearchPathW(searchPath.c_str(), args[iArg + 1], L".exe", exePath)))
+            if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[iArg + 1], L".exe", exePath)))
                 return bypass(format(L"SearchPathW({}) failed", args[iArg + 1]).c_str());
             exeName = PathFindFileNameW(exePath.c_str());
             iArg += 2;
         }
 
         if (settings.logLevel >= log_level_t::trace)
-            Wh_Log(L"  exe = %s [?@%d]", exeName, iArg);
+            Wh_Log(L"  exe = %s [?@%d]", exePath.c_str(), iArg);
 
         // Find python command (pip/venv)
 
@@ -388,7 +405,7 @@ BOOL WINAPI CreateProcessW_Hook(
             if (!settings.replacePip)
                 return bypass(L"settings.replacePip = false");
             // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), pythonName, L".exe");
-            if (FAILED(SearchPathW(searchPath.c_str(), L"python", L".exe", pythonPath)))
+            if (FAILED(SearchPathW(searchPath.c_str(), L"python.exe", nullptr, pythonPath)))
                 return bypass(format(L"SearchPathW({}) failed", L"python").c_str());
             command = command_name_t::pip;
             iArg += 1;
@@ -412,10 +429,27 @@ BOOL WINAPI CreateProcessW_Hook(
         if (command == command_name_t::unknown)
             return bypass(L"unrecognized command");
 
+        // Find uv
+
+        wstring pythonDir = pythonPath;
+        PathRemoveFileSpecW(pythonDir.data());
+        pythonDir.resize(wcslen(pythonDir.c_str()));
+        searchPath =  currentDir + L";" + pythonDir + L";" + pythonDir + L"\\Scripts;" + envPath;
+
+        if (settings.logLevel >= log_level_t::trace)
+            Wh_Log(L"  path = %s...", searchPath.substr(0, min(static_cast<size_t>(160), searchPath.size())).c_str());
+
+        wstring uvPath;
+        if (FAILED(SearchPathW(searchPath.c_str(), L"uv.exe", nullptr, uvPath)))
+            uvPath = sys.uvPath;
+
+        if (settings.logLevel >= log_level_t::trace)
+            Wh_Log(L"  uv = %s", uvPath.c_str());
+
         // Translate arguments
 
         vector<wstring> outArgs {
-            sys.uvPath,
+            uvPath,
             L"--no-python-downloads",
             L"--python-preference", L"only-system",
         };
@@ -458,8 +492,6 @@ BOOL WINAPI CreateProcessW_Hook(
         // C:\Apps\Python\Python312\python.exe -m pip --version
         // "C:\Apps\Python\Python312\python.exe" "C:\Apps\Python\Python312\Scripts\pip.exe" --version <<<<<<<<<<<<<< TODO
         // "C:\Apps\Python\Python312\Scripts\pip.exe" --version
-
-        // TODO: ExpandEnv+SearchPath, not just SearchPath
     });
 }
 
@@ -478,6 +510,7 @@ void LoadSettings() {
     sys.cmdPath = GetEnvironmentVariableW<wstring>(L"ComSpec");
     sys.envPath = GetEnvironmentVariableW<wstring>(L"PATH");
 
+    // TODO: Make global uv optional
     if (settings.uvPath.empty()) {
         THROW_IF_FAILED(SearchPathW(sys.envPath.c_str(), L"uv.exe", nullptr, sys.uvPath));
     } else {
