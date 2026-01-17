@@ -2,8 +2,8 @@
 // @id              python-pip-to-uv
 // @name            Replace Python Pip with UV
 // @name:ru         Заменить Python Pip на UV
-// @description     Replaces calls to os.system(python -m pip) with os.system(uv pip)
-// @description:ru  Заменяет вызовы os.system(python -m pip) на os.system(uv pip)
+// @description     Replaces calls to os.system("python -m pip") with os.system("uv pip")
+// @description:ru  Заменяет вызовы os.system("python -m pip") на os.system("uv pip")
 // @version         0.1
 // @author          Athari
 // @github          https://github.com/Athari
@@ -14,6 +14,8 @@
 // @compilerOptions -lcomdlg32 -lole32 -lshlwapi -Wno-unqualified-std-cast-call
 // @license         MIT
 // ==/WindhawkMod==
+
+// MARK: readme.md
 
 // ==WindhawkModReadme==
 /*
@@ -41,23 +43,29 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 
 * If something goes wrong, enable trace logs in the mod settings. It'll tell you what executables get resolved to what, what paths are searched and how arguments were transformed.
 * If you end up with 500 python processes due to a bug in the mod, the command line you're looking for is `taskkill /im python.exe /f /t` (you may need to run it a few times in rapid sucession). I haven't seen that bug in a while, but just in case.
+
+## ToDo
+
+* Support for `venv` and `virtualenv` is a work in progress.
 */
 // ==/WindhawkModReadme==
+
+// MARK: config.yaml
 
 // ==WindhawkModSettings==
 /*
 - replacePip: true
   $name: Replace pip
-  $description: When enabled, replaces calls to `pip` with `uv pip`
-- replacePythonPip: true
-  $name: Replace python pip
-  $description: When enabled, replaces calls to `python -m pip` with `uv pip`
-- replacePythonVenv: true
-  $name: Replace python venv
-  $description: When enabled, replaces calls to `python -m venv` with `uv venv`
+  $description: When enabled, replaces calls to `pip`, `python -m pip`, `python scripts/pip` with `uv pip`
+# - replaceVenv: true
+#   $name: Replace venv
+#   $description: When enabled, replaces calls to `python -m venv` with `uv venv`
+# - replaceVirtualEnv: true
+#   $name: Replace virtualenv
+#   $description: When enabled, replaces calls to `virtualenv`, `python -m virtualenv`, `python scripts/virtualenv` with `uv venv`
 - uvPath: ""
   $name: Uv path
-  $description: When specified, calls uv from that path, otherwise relies on %PATH%
+  $description: When specified and search for python-specific uv fails, calls uv from that path, otherwise relies on %PATH%
 - uvCacheDir:
   - uvCacheDir: ""
     $name: Uv cache directory
@@ -76,9 +84,9 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
     - symlink: Symlink
     $name: Uv link mode
     $description: When specified, sets method to use when installing packages from cache, otherwise uses UV_LINK_MODE
-  - respectLinkModeArg: false
-    $name: Respect venv arguments
-    $description: When enabled, respects --symlinks and --copies arguments passed to venv
+#   - respectLinkModeArg: false
+#     $name: Respect venv arguments
+#     $description: When enabled, respects --symlinks and --copies arguments passed to venv
   $name: Uv link mode
 - debug:
   - logLevel: info
@@ -94,6 +102,8 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 */
 // ==/WindhawkModSettings==
 
+// MARK: #include
+
 #pragma clang diagnostic ignored "-Wunqualified-std-cast-call" // WHY U NO WORK TIDY???
 
 #include <cstdint>
@@ -108,8 +118,10 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 #include <processenv.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <windows.h>
 #include <winnt.h>
 #include <winuser.h>
+
 #include <wil/stl.h>
 #include <wil/result_macros.h>
 #include <wil/filesystem.h>
@@ -121,6 +133,8 @@ using namespace std;
 using namespace wil;
 
 const size_t MAX_LOG_STR = 160;
+
+// MARK: utils.h
 
 wstring string_to_wstring(const string& s, UINT cp = CP_ACP)
 {
@@ -191,6 +205,8 @@ HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, 
     RETURN_IF_FAILED(searchResult);
     return S_OK;
 }
+
+// MARK: options.h
 
 struct option_t {
     bool isSkipped = false;
@@ -278,9 +294,8 @@ struct {
 
 struct {
     bool replacePip = true;
-    bool replacePythonPip = true;
-    bool replacePythonVenv = true;
-    bool replacePythonVirtualEnv = true;
+    bool replaceVenv = true;
+    bool replaceVirtualEnv = true;
     wstring uvPath;
     wstring uvCacheDir;
     bool respectCacheDirArg = false;
@@ -288,6 +303,8 @@ struct {
     bool respectLinkModeArg = false;
     log_level_t logLevel = log_level_t::info;
 } settings;
+
+// MARK: mod.cpp
 
 template<typename Fn, typename Fail>
 requires is_nothrow_invocable_v<Fail>
@@ -366,6 +383,8 @@ bool translateVirtualEnvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT 
     return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 }
 
+// MARK: CreateProcessW
+
 using CreateProcessW_t = decltype(&CreateProcessW);
 CreateProcessW_t CreateProcessW_Original;
 
@@ -400,10 +419,10 @@ BOOL WINAPI CreateProcessW_Hook(
         // Init
 
         if (settings.logLevel >= log_level_t::info)
-            Wh_Log(L"<- CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
+            Wh_Log(L"<- CreateProcessW (\"%s"", \"%s\", lpCurrentDirectory = \"%s\")",
                 repr(lpApplicationName), repr(lpCommandLine), repr(lpCurrentDirectory));
 
-        if (!settings.replacePip && !settings.replacePythonPip && !settings.replacePythonVenv)
+        if (!settings.replacePip && !settings.replaceVenv && !settings.replaceVirtualEnv)
             return bypass(L"disabled in settings");
 
         // Parse command line into args
@@ -461,40 +480,44 @@ BOOL WINAPI CreateProcessW_Hook(
             } while (0)
 
         wstring pythonPath;
+        wstring scriptsDir;
         if ((wcsistarts(exeName, L"pip") || wcsistarts(exeName, L"virtualenv")) && wcsiends(exeName, L".exe")) {
-            if (FAILED(SearchPathW(searchPath.c_str(), L"python.exe", nullptr, pythonPath)))
+            scriptsDir = PathGetDirNameW(exePath.c_str());
+            auto pythonSearchPath = PathGetDirNameW(scriptsDir.c_str()) + L";" + searchPath;
+            if (FAILED(SearchPathW(pythonSearchPath.c_str(), L"python.exe", nullptr, pythonPath)))
                 return bypass(format(L"SearchPathW({}) failed", L"python").c_str());
+
             if (wcsistarts(exeName, L"pip"))
                 SET_COMMAND_NAME(replacePip, pip); // ... pip.exe ...
             else if (wcsistarts(exeName, L"virtualenv"))
-                SET_COMMAND_NAME(replacePip, pip); // ... virtualenv.exe ...
+                SET_COMMAND_NAME(replaceVirtualEnv, pip); // ... virtualenv.exe ...
             else
                 return bypass(L"unknown module.exe");
-            iArg += 1;
         } else if (wcsistarts(exeName, L"python")) {
             pythonPath = exePath;
-            wstring pythonDir = PathGetDirNameW(pythonPath.c_str());
-            searchPath =  currentDir + L";" + pythonDir + L";" + pythonDir + L"\\Scripts;" + envPath;
+            auto pythonDir = PathGetDirNameW(pythonPath.c_str());
+            scriptsDir = pythonDir + L"\\Scripts";
 
             if (args.size() > iArg + 1 && wcsequals(args[iArg], L"-m")) {
                 if (wcsequals(args[iArg + 1], L"pip"))
-                    SET_COMMAND_NAME(replacePythonPip, pip); // ... python.exe -m pip ...
+                    SET_COMMAND_NAME(replacePip, pip); // ... python.exe -m pip ...
                 else if (wcsequals(args[iArg + 1], L"venv"))
-                    SET_COMMAND_NAME(replacePythonVenv, venv); // ... python.exe -m venv ...
+                    SET_COMMAND_NAME(replaceVenv, venv); // ... python.exe -m venv ...
                 else if (wcsequals(args[iArg + 1], L"virtualenv"))
-                    SET_COMMAND_NAME(replacePythonVirtualEnv, virtualenv); // ... python.exe -m virtualenv ...
+                    SET_COMMAND_NAME(replaceVirtualEnv, virtualenv); // ... python.exe -m virtualenv ...
                 else
                     return bypass(L"unknown python -m module");
                 iArg += 2;
             } else {
                 wstring scriptPath;
-                if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[iArg], L".exe", scriptPath)))
+                if (FAILED(ExpandEnvAndSearchPathW(scriptsDir.c_str(), args[iArg], L".exe", scriptPath)))
                     return bypass(format(L"SearchPathW({}) failed", args[iArg]).c_str());
+
                 auto scriptName = PathFindFileNameW(scriptPath.c_str());
                 if (wcsistarts(scriptName, L"pip") && wcsiends(scriptName, L".exe"))
-                    SET_COMMAND_NAME(replacePythonPip, pip); // ... python.exe scripts/pip.exe ...
+                    SET_COMMAND_NAME(replacePip, pip); // ... python.exe scripts/pip.exe ...
                 else if (wcsistarts(scriptName, L"virtualenv") && wcsiends(scriptName, L".exe"))
-                    SET_COMMAND_NAME(replacePythonVirtualEnv, virtualenv); // ... python.exe scripts/virtualenv.exe ...
+                    SET_COMMAND_NAME(replaceVirtualEnv, virtualenv); // ... python.exe scripts/virtualenv.exe ...
                 else
                     return bypass(L"unknown python module.exe");
                 iArg++;
@@ -511,11 +534,8 @@ BOOL WINAPI CreateProcessW_Hook(
 
         // Find uv
 
-        if (settings.logLevel >= log_level_t::trace)
-            Wh_Log(L"  path = %s...", searchPath.substr(0, min(MAX_LOG_STR, searchPath.size())).c_str());
-
         wstring uvPath;
-        if (FAILED(SearchPathW(searchPath.c_str(), L"uv.exe", nullptr, uvPath)))
+        if (FAILED(SearchPathW(scriptsDir.c_str(), L"uv.exe", nullptr, uvPath)))
             uvPath = sys.defaultUvPath;
         if (uvPath.empty())
             return bypass(L"failed to find uv");
@@ -553,7 +573,7 @@ BOOL WINAPI CreateProcessW_Hook(
         auto newApplicationName = outArgs[0];
         auto newCommandLine = ArgvToCommandLine<vector<wstring>&, wchar_t>(outArgs);
         if (settings.logLevel >= log_level_t::info)
-            Wh_Log(L"-> CreateProcessW (lpApplicationName = %s, lpCommandLine = %s, lpCurrentDirectory = %s)",
+            Wh_Log(L"-> CreateProcessW (\"%s\", \"%s\")",
                 repr(newApplicationName.c_str()), repr(newCommandLine.data()), repr(lpCurrentDirectory));
 
         // return fail();
@@ -569,6 +589,8 @@ BOOL WINAPI CreateProcessW_Hook(
         // * depends on settings: --symlinks, --copies
     });
 }
+
+// MARK: main
 
 wstring FindGlobalUvPath() {
     wstring uvPath;
@@ -591,8 +613,8 @@ wstring FindGlobalUvPath() {
 
 void LoadSettings() {
     settings.replacePip = Wh_GetBoolSetting(L"replacePip");
-    settings.replacePythonPip = Wh_GetBoolSetting(L"replacePythonPip");
-    settings.replacePythonVenv = Wh_GetBoolSetting(L"replacePythonVenv");
+    settings.replaceVenv = Wh_GetBoolSetting(L"replaceVenv");
+    settings.replaceVirtualEnv = Wh_GetBoolSetting(L"replaceVirtualEnv");
     settings.uvPath = Wh_GetStdStringSetting(L"uvPath");
     settings.uvCacheDir = Wh_GetStdStringSetting(L"uvCacheDir.uvCacheDir");
     settings.respectCacheDirArg = Wh_GetBoolSetting(L"uvCacheDir.respectCacheDirArg");
