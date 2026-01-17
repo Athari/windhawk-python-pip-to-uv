@@ -104,7 +104,7 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 
 // MARK: #include
 
-#pragma clang diagnostic ignored "-Wunqualified-std-cast-call" // WHY U NO WORK TIDY???
+#pragma clang diagnostic ignored "-Wunqualified-std-cast-call" // WHY U NO WORK TIDY CONFIG???
 
 #include <exception>
 #include <cwchar>
@@ -373,12 +373,12 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
 }
 
 // NOLINTNEXTLINE - TODO
-bool translateVenvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
+HRESULT translateVenvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
     return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 }
 
 // NOLINTNEXTLINE - TODO
-bool translateVirtualEnvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
+HRESULT translateVirtualEnvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
     return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 }
 
@@ -418,7 +418,7 @@ BOOL WINAPI CreateProcessW_Hook(
         // Init
 
         if (settings.logLevel >= log_level_t::info)
-            Wh_Log(L"<- CreateProcessW (\"%s"", \"%s\", lpCurrentDirectory = \"%s\")",
+            Wh_Log(L"<- CreateProcessW (\"%s\", \"%s\", lpCurrentDirectory = \"%s\")",
                 repr(lpApplicationName), repr(lpCommandLine), repr(lpCurrentDirectory));
 
         if (!settings.replacePip && !settings.replaceVenv && !settings.replaceVirtualEnv)
@@ -489,7 +489,7 @@ BOOL WINAPI CreateProcessW_Hook(
             if (wcsistarts(exeName, L"pip"))
                 SET_COMMAND_NAME(replacePip, pip); // ... pip.exe ...
             else if (wcsistarts(exeName, L"virtualenv"))
-                SET_COMMAND_NAME(replaceVirtualEnv, pip); // ... virtualenv.exe ...
+                SET_COMMAND_NAME(replaceVirtualEnv, virtualenv); // ... virtualenv.exe ...
             else
                 return bypass(L"unknown module.exe");
         } else if (wcsistarts(exeName, L"python")) {
@@ -573,7 +573,7 @@ BOOL WINAPI CreateProcessW_Hook(
         auto newCommandLine = ArgvToCommandLine<vector<wstring>&, wchar_t>(outArgs);
         if (settings.logLevel >= log_level_t::info)
             Wh_Log(L"-> CreateProcessW (\"%s\", \"%s\")",
-                repr(newApplicationName.c_str()), repr(newCommandLine.data()), repr(lpCurrentDirectory));
+                repr(newApplicationName.c_str()), repr(newCommandLine.data()));
 
         // return fail();
         return CreateProcessW_Original(
@@ -591,23 +591,20 @@ BOOL WINAPI CreateProcessW_Hook(
 
 // MARK: main
 
-wstring FindGlobalUvPath() {
-    wstring uvPath;
-    ([&]() -> HRESULT {
-        auto envPath = GetEnvironmentVariableW<wstring>(L"PATH");
-        if (settings.uvPath.empty()) {
-            RETURN_IF_FAILED(SearchPathW(envPath.c_str(), L"uv.exe", nullptr, sys.defaultUvPath));
-        } else {
-            auto expandedUvPath = ExpandEnvironmentStringsW(settings.uvPath.c_str());
-            auto attr = GetFileAttributes(expandedUvPath.get());
-            if (attr & FILE_ATTRIBUTE_DIRECTORY)
-                RETURN_IF_FAILED(SearchPathW(expandedUvPath.get(), L"uv.exe", nullptr, sys.defaultUvPath));
-            else
-                RETURN_IF_FAILED(SearchPathW(envPath.c_str(), expandedUvPath.get(), L".exe", sys.defaultUvPath));
-        }
-        return S_OK;
-    })();
-    return uvPath;
+HRESULT FindGlobalUvPath(wstring& uvPath) {
+    auto envPath = GetEnvironmentVariableW<wstring>(L"PATH");
+    if (settings.uvPath.empty()) {
+        RETURN_IF_FAILED(SearchPathW(envPath.c_str(), L"uv.exe", nullptr, uvPath));
+    } else {
+        auto expandedUvPath = ExpandEnvironmentStringsW(settings.uvPath.c_str());
+        auto attr = GetFileAttributesW(expandedUvPath.get());
+        RETURN_LAST_ERROR_IF_EXPECTED(attr == INVALID_FILE_ATTRIBUTES);
+        if (attr & FILE_ATTRIBUTE_DIRECTORY)
+            RETURN_IF_FAILED(SearchPathW(expandedUvPath.get(), L"uv.exe", nullptr, uvPath));
+        else
+            RETURN_IF_FAILED(SearchPathW(envPath.c_str(), expandedUvPath.get(), L".exe", uvPath));
+    }
+    return S_OK;
 }
 
 void LoadSettings() {
@@ -622,7 +619,9 @@ void LoadSettings() {
     auto logLevel = Wh_GetStdStringSetting(L"debug.logLevel");
     settings.logLevel = logLevels.contains(logLevel) ? logLevels.at(logLevel) : log_level_t::info;
 
-    sys.defaultUvPath = FindGlobalUvPath();
+    if (FAILED(FindGlobalUvPath(sys.defaultUvPath)))
+        sys.defaultUvPath = L"";
+
     if (settings.logLevel >= log_level_t::info)
         Wh_Log(L"defaultUvPath = %s", sys.defaultUvPath.c_str());
     if (settings.logLevel >= log_level_t::debug)
@@ -631,7 +630,7 @@ void LoadSettings() {
 
 BOOL Wh_ModInit() {
     return Attempt(L"ModInit", []() noexcept { return FALSE; }, []() {
-        if (settings.logLevel >= log_level_t::info)
+        if (settings.logLevel >= log_level_t::info) // technically unconditional
             Wh_Log(L"ModInit in %s", GetModuleFileNameW().get());
 
         LoadSettings();
