@@ -106,7 +106,6 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 
 #pragma clang diagnostic ignored "-Wunqualified-std-cast-call" // WHY U NO WORK TIDY???
 
-#include <cstdint>
 #include <exception>
 #include <cwchar>
 #include <stdexcept>
@@ -265,14 +264,14 @@ const auto pipCommands = unordered_map<wstring, command_t> {
     { L"wheel",      command_t::unsupported }, // https://github.com/astral-sh/uv/issues/1681
 };
 
-enum class command_name_t : uint8_t {
+enum class command_name_t {
     unknown,
     pip,
     venv,
     virtualenv,
 };
 
-enum class log_level_t : uint8_t {
+enum class log_level_t {
     error,
     warn,
     info,
@@ -325,7 +324,7 @@ void DoNothing() noexcept {}
 
 HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, const wstring& pythonPath, vector<wstring>& outArgs) {
     vector<wstring> otherArgs {};
-    bool isCacheDirSet;
+    auto isCacheDirSet = false;
     wstring pipCommand;
 
     for (; iArg < args.size(); iArg++) {
@@ -394,7 +393,7 @@ BOOL WINAPI CreateProcessW_Hook(
     BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
     LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation
 ) {
-    bool bypassed = false;
+    auto bypassed = false;
 
     // auto fail = [&]() {
     //     SetLastError(ERROR_NOT_SUPPORTED);
