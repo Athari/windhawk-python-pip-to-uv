@@ -7,5 +7,4 @@
     "git.enabled": true,
     "clangd.path": "C:/Program Files/Windhawk/Compiler/bin/clangd.exe",
     "C_Cpp.intelliSenseEngine": "disabled",
-    "python.defaultInterpreterPath": "C:/Apps/Python/Python312/python.exe",
 }
