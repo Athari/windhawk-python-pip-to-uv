@@ -6,6 +6,8 @@ import subprocess
 
 python_dir = os.path.dirname(sys.executable)
 
+# os.system(python_dir + "/scripts/pip")
+# os.system(python_dir + "/scripts/pip.exe")
 os.system(python_dir + "/scripts/pip --version")
 os.system(python_dir + "/scripts/pip.exe --version")
 os.system(sys.executable + " -m pip --version")
@@ -13,6 +15,26 @@ os.system(sys.executable + " pip --version") # doesn't work without mod
 os.system(sys.executable + " pip.exe --version") # doesn't work without mod
 os.system(sys.executable + " " + python_dir + "/scripts/pip --version") # doesn't work without mod
 os.system(sys.executable + " " + python_dir + "/scripts/pip.exe --version")
+
+# subprocess.run([python_dir + "/scripts/pip"])
+# subprocess.run([python_dir + "/scripts/pip.exe"])
+subprocess.run([python_dir + "/scripts/pip", "--version"])
+subprocess.run([python_dir + "/scripts/pip.exe", "--version"])
+subprocess.run([sys.executable, "-m", "pip", "--version"])
+subprocess.run([sys.executable, "pip", "--version"])
+subprocess.run([sys.executable, "pip.exe", "--version"])
+subprocess.run([sys.executable, python_dir + "/scripts/pip", "--version"])
+subprocess.run([sys.executable, python_dir + "/scripts/pip.exe", "--version"])
+
+# subprocess.run(["cmd", "/c", python_dir + "/scripts/pip"])
+# subprocess.run(["cmd", "/c", python_dir + "/scripts/pip.exe"])
+subprocess.run(["cmd", "/c", python_dir + "/scripts/pip --version"])
+subprocess.run(["cmd", "/c", python_dir + "/scripts/pip.exe --version"])
+subprocess.run(["cmd", "/c", sys.executable + " -m pip --version"])
+subprocess.run(["cmd", "/c", sys.executable + " pip --version"])
+subprocess.run(["cmd", "/c", sys.executable + " pip.exe --version"])
+subprocess.run(["cmd", "/c", sys.executable + " " + python_dir + "/scripts/pip --version"])
+subprocess.run(["cmd", "/c", sys.executable + " " + python_dir + "/scripts/pip.exe --version"])
 
 # os.system(sys.executable + " -m pip --version")
 # os.system(sys.executable + " -m pip --help")
@@ -26,12 +48,14 @@ os.system(sys.executable + " " + python_dir + "/scripts/pip.exe --version")
 os.environ["PATH"] = python_dir + ";" + python_dir + "/scripts;" + os.environ["PATH"]
 # print(os.environ["PATH"])
 
+# os.system(python_dir + "/scripts/pip")
+# os.system(python_dir + "/scripts/pip.exe")
 os.system(python_dir + "/scripts/pip --version")
 os.system(python_dir + "/scripts/pip.exe --version")
-os.system("python -m pip --version") # doesn't work without mod
-os.system("python pip --version") # doesn't work without mod
-os.system("python pip.exe --version") # doesn't work without mod
-os.system("python " + python_dir + "/scripts/pip --version") # doesn't work without mod
+os.system("python -m pip --version")
+os.system("python pip --version")
+os.system("python pip.exe --version")
+os.system("python " + python_dir + "/scripts/pip --version")
 os.system("python " + python_dir + "/scripts/pip.exe --version")
 
 # os.system("python -m pip --version")
