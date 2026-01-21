@@ -38,6 +38,8 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 
 Translation of `venv` and `virtualenv` to `uv venv` is more precise — the mod skips all unsupported options.
 
+The mod restricts smart handling of python versions uv with `--no-python-downloads` and `--python-preference only-system` arguments to reflect how pre-uv commands function.
+
 ## Configuration
 
 * The mod will try to use Python-specific `uv` when available, but will fall back to global `uv`, if it exists. Hint: run `winget install astral-sh.uv`.
@@ -405,7 +407,7 @@ HRESULT translateVenvArgs(const unordered_map<wstring, option_t>& options,
 ) {
     vector<wstring> otherArgs {};
     wstring linkMode = settings.uvLinkMode;
-    bool hasNoSeed = false;
+    bool hasSeed = true;
     wstring envDir;
 
     for (; iArg < args.size(); iArg++) {
@@ -418,7 +420,7 @@ HRESULT translateVenvArgs(const unordered_map<wstring, option_t>& options,
         } else if (wcsequals(arg, L"--copies") && settings.respectLinkModeArg) {
             linkMode = L"copy";
         } else if (wcsequals(arg, L"--no-seed") || wcsequals(arg, L"--without-pip")) {
-            hasNoSeed = true;
+            hasSeed = false;
         } else if (opt.isSkipped) {
             if (opt.hasArg)
                 iArg++;
@@ -437,14 +439,15 @@ HRESULT translateVenvArgs(const unordered_map<wstring, option_t>& options,
     }
 
     outArgs.emplace_back(L"venv");
+    if (!envDir.empty())
+        outArgs.emplace_back(envDir);
+
     outArgs.append_range(otherArgs);
     outArgs.append_range(array { wstring(L"--python"), pythonPath });
 
-    if (!envDir.empty())
-        outArgs.emplace_back(envDir);
     if (!linkMode.empty())
         outArgs.append_range(array { wstring(L"--link-mode"), linkMode });
-    if (!hasNoSeed)
+    if (hasSeed)
         outArgs.emplace_back(L"--seed");
 
     return S_OK;
@@ -495,14 +498,9 @@ BOOL WINAPI CreateProcessW_Hook(
         // Parse command line into args
 
         auto commandLine = !wcsempty(lpCommandLine) ? lpCommandLine : lpApplicationName;
-        if (wcsempty(commandLine))
-            return bypass(L"empty command line");
-
         unique_hlocal_array_ptr<LPCWSTR> args;
         if (FAILED(CommandLineToArgvW(commandLine, args)) || args.empty())
-            return bypass(L"CommandLineToArgvW failed");
-        if (args.size() <= 1)
-            return bypass(L"command line too short");
+            return bypass(format(L"CommandLineToArgvW({}) failed", commandLine).c_str());
 
         if (settings.logLevel >= log_level_t::trace)
             for (size_t i = 0; i < args.size(); i++)
@@ -519,19 +517,30 @@ BOOL WINAPI CreateProcessW_Hook(
 
         wstring exePath;
         if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[0], L".exe", exePath)))
-            return bypass(format(L"SearchPathW({}) failed", args[0]).c_str());
+            return bypass(format(L"ExpandEnvAndSearchPathW({}) failed", args[0]).c_str());
 
         auto exeName = PathFindFileNameW(exePath.c_str());
         auto iArg = 1U;
         auto command = command_name_t::unknown;
 
         if (wcsistarts(exeName, L"cmd.exe") && args.size() > iArg + 1 && wcsistarts(args[iArg], L"/c")) {
-            // cmd.exe /c ...
+            if (args.size() == iArg + 2) {
+                // cmd.exe /c "... ..."
+                if (FAILED(CommandLineToArgvW(args[iArg + 1], args)) || args.empty())
+                    return bypass(format(L"CommandLineToArgvW({}) failed", args[iArg + 1]).c_str());
+
+                iArg = 0;
+            } else {
+                // cmd.exe /c ...
+                iArg++;
+            }
+
             // Wh_Log(LR"'(  SearchPathW("%s", "%s", "%s"))'", searchPath.substr(0, 256).c_str(), args[iArg + 1], L".exe");
-            if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[iArg + 1], L".exe", exePath)))
-                return bypass(format(L"SearchPathW({}) failed", args[iArg + 1]).c_str());
+            if (FAILED(ExpandEnvAndSearchPathW(searchPath.c_str(), args[iArg], L".exe", exePath)))
+                return bypass(format(L"ExpandEnvAndSearchPathW({}) failed", args[iArg]).c_str());
+
             exeName = PathFindFileNameW(exePath.c_str());
-            iArg += 2;
+            iArg++;
         }
 
         if (settings.logLevel >= log_level_t::trace)
