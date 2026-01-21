@@ -8,6 +8,7 @@ python_dir = os.path.dirname(sys.executable)
 
 os.system(python_dir + "/scripts/pip --version")
 os.system(python_dir + "/scripts/pip.exe --version")
+os.system(sys.executable + " -m pip --version")
 os.system(sys.executable + " pip --version") # doesn't work without mod
 os.system(sys.executable + " pip.exe --version") # doesn't work without mod
 os.system(sys.executable + " " + python_dir + "/scripts/pip --version") # doesn't work without mod
@@ -27,6 +28,7 @@ os.environ["PATH"] = python_dir + ";" + python_dir + "/scripts;" + os.environ["P
 
 os.system(python_dir + "/scripts/pip --version")
 os.system(python_dir + "/scripts/pip.exe --version")
+os.system("python -m pip --version") # doesn't work without mod
 os.system("python pip --version") # doesn't work without mod
 os.system("python pip.exe --version") # doesn't work without mod
 os.system("python " + python_dir + "/scripts/pip --version") # doesn't work without mod
