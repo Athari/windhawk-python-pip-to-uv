@@ -27,12 +27,16 @@ The primary purpose of this mod is to enforce uv's caching and performance onto 
 
 ## Features
 
-* Handles all ways of running pip: `pip`, `python -m pip`, `cmd /c python -m pip`, `python scripts\pip.exe`.
+* Handles all ways of running pip: `[cmd[.exe] /c]` { `pip[.exe]` | `python[.exe]` { `-m pip` | `scripts\pip[.exe]` } }.
+* Handles all ways of running venv: `[cmd[.exe] /c] python[.exe]` { `-m venv` | `scripts\venv[.exe]` }.
+* Handles all ways of running virtualenv: `[cmd[.exe] /c]` { `virtualenv[.exe]` | `python[.exe]` { `-m virtualenv` | `scripts\virtualenv[.exe]` } }.
 * Handles all modules which end up calling `CreateProcessW`: `os.system`, `subprocess.run` etc.
 * Handles all python processes, including installed manually, managed by uv, bundled with electron apps etc.
 * Handles `cache-dir` and `link-mode` options of `uv` and allows overriding them via settings and/or arguments.
 
 The mod *does not* handle `pip` any better than `uv` — it just blindly replaces arguments, as long as the `uv pip` subcommand is supported. Unsupported subcommands fall back to running `pip`. Notably, these include `download` and `wheel`, which haven't been implemented in `uv` yet.
+
+Translation of `venv` and `virtualenv` to `uv venv` is more precise — the mod skips all unsupported options.
 
 ## Configuration
 
@@ -43,10 +47,6 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 
 * If something goes wrong, enable trace logs in the mod settings. It'll tell you what executables get resolved to what, what paths are searched and how arguments were transformed.
 * If you end up with 500 python processes due to a bug in the mod, the command line you're looking for is `taskkill /im python.exe /f /t` (you may need to run it a few times in rapid sucession). I haven't seen that bug in a while, but just in case.
-
-## ToDo
-
-* Support for `venv` and `virtualenv` is a work in progress.
 */
 // ==/WindhawkModReadme==
 
@@ -57,12 +57,12 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
 - replacePip: true
   $name: Replace pip
   $description: When enabled, replaces calls to `pip`, `python -m pip`, `python scripts/pip` with `uv pip`
-# - replaceVenv: true
-#   $name: Replace venv
-#   $description: When enabled, replaces calls to `python -m venv` with `uv venv`
-# - replaceVirtualEnv: true
-#   $name: Replace virtualenv
-#   $description: When enabled, replaces calls to `virtualenv`, `python -m virtualenv`, `python scripts/virtualenv` with `uv venv`
+- replaceVenv: true
+  $name: Replace venv
+  $description: When enabled, replaces calls to `python -m venv` with `uv venv`
+- replaceVirtualEnv: true
+  $name: Replace virtualenv
+  $description: When enabled, replaces calls to `virtualenv`, `python -m virtualenv`, `python scripts/virtualenv` with `uv venv`
 - uvPath: ""
   $name: Uv path
   $description: When specified and search for python-specific uv fails, calls uv from that path, otherwise relies on %PATH%
@@ -84,9 +84,9 @@ The mod *does not* handle `pip` any better than `uv` — it just blindly replace
     - symlink: Symlink
     $name: Uv link mode
     $description: When specified, sets method to use when installing packages from cache, otherwise uses UV_LINK_MODE
-#   - respectLinkModeArg: false
-#     $name: Respect venv arguments
-#     $description: When enabled, respects --symlinks and --copies arguments passed to venv
+  - respectLinkModeArg: false
+    $name: Respect venv arguments
+    $description: When enabled, respects --symlinks and --copies arguments passed to venv
   $name: Uv link mode
 - debug:
   - logLevel: info
@@ -264,6 +264,33 @@ const auto pipCommands = unordered_map<wstring, command_t> {
     { L"wheel",      command_t::unsupported }, // https://github.com/astral-sh/uv/issues/1681
 };
 
+const auto venvOptions = unordered_map<wstring, option_t> {
+    { L"--clear",                option_t::skip },
+    { L"--upgrade",              option_t::skip },
+    { L"--upgrade-deps",         option_t::skip },
+    { L"--symlinks",             option_t::skip },
+    { L"--copies",               option_t::skip },
+    { L"--without-pip",          option_t::skip },
+    { L"--prompt",               option_t::withArg },
+};
+
+const auto virtualenvOptions = unordered_map<wstring, option_t> {
+    { L"--clear",                option_t::skip },
+    { L"--no-vcs-ignore",        option_t::skip },
+    { L"--no-download",          option_t::skip },
+    { L"--never-download",       option_t::skip },
+    { L"--symlinks",             option_t::skip },
+    { L"--copies",               option_t::skip },
+    { L"--no-seed",              option_t::skip },
+    { L"--without-pip",          option_t::skip },
+    { L"--seeder",               option_t::skipWithArg },
+    { L"--creator",              option_t::skipWithArg },
+    { L"--activators",           option_t::skipWithArg },
+    { L"--prompt",               option_t::withArg },
+    { L"--python",               option_t::withArg },
+    { L"-p",                     option_t::withArg },
+};
+
 enum class command_name_t {
     unknown,
     pip,
@@ -286,6 +313,8 @@ const auto logLevels = unordered_map<wstring, log_level_t> {
     { L"debug", log_level_t::debug },
     { L"trace", log_level_t::trace },
 };
+
+// MARK: settings.h
 
 struct {
     wstring defaultUvPath;
@@ -329,19 +358,18 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
 
     for (; iArg < args.size(); iArg++) {
         auto arg = args[iArg];
-        if (wcsequals(arg, L"--cache-dir") && args.size() > iArg + 1 && settings.respectCacheDirArg) {
+        auto opt = pipOptions.contains(arg) ? pipOptions.at(arg) : wcsstarts(arg, L"-") ? option_t::simple : option_t::command;
+        auto hasNextArg = args.size() > iArg + 1;
+
+        if (wcsequals(arg, L"--cache-dir") && hasNextArg && settings.respectCacheDirArg) {
             outArgs.append_range(array { arg, args[iArg + 1] });
             isCacheDirSet = true;
             iArg++;
-            continue;
-        }
-
-        auto opt = pipOptions.contains(arg) ? pipOptions.at(arg) : wcsstarts(arg, L"-") ? option_t::simple : option_t::command;
-        if (opt.isSkipped) {
+        } else if (opt.isSkipped) {
             if (opt.hasArg)
                 iArg++;
         } else if (!opt.isCommand) {
-            if (opt.hasArg && args.size() > iArg + 1) {
+            if (opt.hasArg && hasNextArg) {
                 otherArgs.append_range(array { arg, args[iArg + 1] });
                 iArg++;
             } else {
@@ -372,14 +400,54 @@ HRESULT translatePipArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg
     return S_OK;
 }
 
-// NOLINTNEXTLINE - TODO
-HRESULT translateVenvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
-    return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-}
+HRESULT translateVenvArgs(const unordered_map<wstring, option_t>& options,
+    const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, const wstring& pythonPath, vector<wstring>& outArgs
+) {
+    vector<wstring> otherArgs {};
+    wstring linkMode = settings.uvLinkMode;
+    bool hasNoSeed = false;
+    wstring envDir;
 
-// NOLINTNEXTLINE - TODO
-HRESULT translateVirtualEnvArgs(const unique_hlocal_array_ptr<LPCWSTR>& args, UINT iArg, vector<wstring>& outArgs) {
-    return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    for (; iArg < args.size(); iArg++) {
+        auto arg = args[iArg];
+        auto opt = options.contains(arg) ? options.at(arg) : wcsstarts(arg, L"-") ? option_t::simple : option_t::command;
+        auto hasNextArg = args.size() > iArg + 1;
+
+        if (wcsequals(arg, L"--symlinks") && settings.respectLinkModeArg) {
+            linkMode = L"symlink";
+        } else if (wcsequals(arg, L"--copies") && settings.respectLinkModeArg) {
+            linkMode = L"copy";
+        } else if (wcsequals(arg, L"--no-seed") || wcsequals(arg, L"--without-pip")) {
+            hasNoSeed = true;
+        } else if (opt.isSkipped) {
+            if (opt.hasArg)
+                iArg++;
+        } else if (!opt.isCommand) {
+            if (opt.hasArg && hasNextArg) {
+                otherArgs.append_range(array { arg, args[iArg + 1] });
+                iArg++;
+            } else {
+                otherArgs.emplace_back(arg);
+            }
+        } else {
+            if (envDir.empty())
+                envDir = arg;
+            otherArgs.emplace_back(arg);
+        }
+    }
+
+    outArgs.emplace_back(L"venv");
+    outArgs.append_range(otherArgs);
+    outArgs.append_range(array { wstring(L"--python"), pythonPath });
+
+    if (!envDir.empty())
+        outArgs.emplace_back(envDir);
+    if (!linkMode.empty())
+        outArgs.append_range(array { wstring(L"--link-mode"), linkMode });
+    if (!hasNoSeed)
+        outArgs.emplace_back(L"--seed");
+
+    return S_OK;
 }
 
 // MARK: CreateProcessW
@@ -554,10 +622,10 @@ BOOL WINAPI CreateProcessW_Hook(
             if (FAILED(translatePipArgs(args, iArg, pythonPath, outArgs)))
                 return bypass(L"uv pip command not supported");
         } else if (command == command_name_t::venv) {
-            if (FAILED(translateVenvArgs(args, iArg, outArgs)))
+            if (FAILED(translateVenvArgs(venvOptions, args, iArg, pythonPath, outArgs)))
                 return bypass(L"uv venv command not supported");
         } else if (command == command_name_t::virtualenv) {
-            if (FAILED(translateVirtualEnvArgs(args, iArg, outArgs)))
+            if (FAILED(translateVenvArgs(virtualenvOptions, args, iArg, pythonPath, outArgs)))
                 return bypass(L"uv virtualenv command not supported");
         } else {
             throw runtime_error("unexpected command");
@@ -580,12 +648,6 @@ BOOL WINAPI CreateProcessW_Hook(
             newApplicationName.c_str(), newCommandLine.data(),
             lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags,
             lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-
-        // TODO venv
-        // python -m venv [-h] [--system-site-packages] [--symlinks | --copies] [--clear] [--upgrade] [--without-pip] [--prompt PROMPT] [--upgrade-deps] ENV_DIR [ENV_DIR ...]
-        // uv venv [OPTIONS] [NAME]
-        // * exact matches: --prompt, --system-site-packages
-        // * depends on settings: --symlinks, --copies
     });
 }
 
