@@ -110,8 +110,11 @@ The mod restricts smart handling of python versions uv with `--no-python-downloa
 
 #include <exception>
 #include <cwchar>
+#include <format>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -209,6 +212,17 @@ HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, 
 
 // MARK: options.h
 
+template<typename T>
+unordered_map<wstring, T>
+make_map_from_groups(initializer_list<pair<T, initializer_list<wstring>>> groups)
+{
+    unordered_map<wstring, T> m;
+    for (auto const &group : groups)
+        for (auto const &key : group.second)
+            m.emplace(key, group.first);
+    return m;
+}
+
 struct option_t {
     bool isSkipped = false;
     bool hasArg = false;
@@ -238,60 +252,46 @@ const command_t command_t::unsupported  { .isSupported = false };
 const command_t command_t::supported    {};
 const command_t command_t::withLinkMode { .hasLinkMode = true };
 
-const auto pipOptions = unordered_map<wstring, option_t> {
-    { L"--no-cache-dir",     option_t::skip },
-    { L"--cache-dir",        option_t::skipWithArg },
-    { L"--python",           option_t::skipWithArg },
-    { L"--log",              option_t::withArg },
-    { L"--keyring-provider", option_t::withArg },
-    { L"--proxy",            option_t::withArg },
-    { L"--retries",          option_t::withArg },
-    { L"--timeout",          option_t::withArg },
-    { L"--exists-action",    option_t::withArg },
-    { L"--trusted-host",     option_t::withArg },
-    { L"--cert",             option_t::withArg },
-    { L"--client-cert",      option_t::withArg },
-    { L"--use-feature",      option_t::withArg },
-    { L"--use-deprecated",   option_t::withArg },
-};
+const auto pipCommands = make_map_from_groups<command_t>({
+    { command_t::withLinkMode,
+        { L"install" } },
+    { command_t::supported,
+        { L"uninstall", L"freeze", L"list", L"show", L"check" } },
+    { command_t::unsupported,
+        { L"download", // https://github.com/astral-sh/uv/issues/3163
+          L"wheel"     // https://github.com/astral-sh/uv/issues/1681
+        } },
+});
 
-const auto pipCommands = unordered_map<wstring, command_t> {
-    { L"install",    command_t::withLinkMode },
-    { L"uninstall",  command_t::supported },
-    { L"freeze",     command_t::supported },
-    { L"list",       command_t::supported },
-    { L"show",       command_t::supported },
-    { L"check",      command_t::supported },
-    { L"download",   command_t::unsupported }, // https://github.com/astral-sh/uv/issues/3163
-    { L"wheel",      command_t::unsupported }, // https://github.com/astral-sh/uv/issues/1681
-};
+const auto pipOptions = make_map_from_groups<option_t>({
+    { option_t::skip,
+        { L"--no-cache-dir" } },
+    { option_t::skipWithArg,
+        { L"--cache-dir", L"--python" } },
+    { option_t::withArg,
+        { // general
+          L"--log", L"--keyring-provider", L"--proxy", L"--retries", L"--timeout", L"--exists-action",
+          L"--trusted-host", L"--cert", L"--client-cert", L"--use-feature", L"--use-deprecated",
+          // install
+          // TODO: add withArg options for install and other supported commands
+        } },
+});
 
-const auto venvOptions = unordered_map<wstring, option_t> {
-    { L"--clear",                option_t::skip },
-    { L"--upgrade",              option_t::skip },
-    { L"--upgrade-deps",         option_t::skip },
-    { L"--symlinks",             option_t::skip },
-    { L"--copies",               option_t::skip },
-    { L"--without-pip",          option_t::skip },
-    { L"--prompt",               option_t::withArg },
-};
+const auto venvOptions = make_map_from_groups<option_t>({
+    { option_t::skip,
+        { L"--clear", L"--upgrade", L"--upgrade-deps", L"--symlinks", L"--copies", L"--without-pip" } },
+    { option_t::withArg,
+        { L"--prompt" } },
+});
 
-const auto virtualenvOptions = unordered_map<wstring, option_t> {
-    { L"--clear",                option_t::skip },
-    { L"--no-vcs-ignore",        option_t::skip },
-    { L"--no-download",          option_t::skip },
-    { L"--never-download",       option_t::skip },
-    { L"--symlinks",             option_t::skip },
-    { L"--copies",               option_t::skip },
-    { L"--no-seed",              option_t::skip },
-    { L"--without-pip",          option_t::skip },
-    { L"--seeder",               option_t::skipWithArg },
-    { L"--creator",              option_t::skipWithArg },
-    { L"--activators",           option_t::skipWithArg },
-    { L"--prompt",               option_t::withArg },
-    { L"--python",               option_t::withArg },
-    { L"-p",                     option_t::withArg },
-};
+const auto virtualenvOptions = make_map_from_groups<option_t>({
+    { option_t::skip,
+        { L"--clear", L"--no-vcs-ignore", L"--no-download", L"--never-download", L"--symlinks", L"--copies", L"--no-seed", L"--without-pip" } },
+    { option_t::skipWithArg,
+        { L"--seeder", L"--creator", L"--activators" } },
+    { option_t::withArg,
+        { L"--prompt", L"--python", L"-p" } },
+});
 
 enum class command_name_t {
     unknown,
@@ -528,7 +528,6 @@ BOOL WINAPI CreateProcessW_Hook(
                 // cmd.exe /c "... ..."
                 if (FAILED(CommandLineToArgvW(args[iArg + 1], args)) || args.empty())
                     return bypass(format(L"CommandLineToArgvW({}) failed", args[iArg + 1]).c_str());
-
                 iArg = 0;
             } else {
                 // cmd.exe /c ...
