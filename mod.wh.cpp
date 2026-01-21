@@ -253,44 +253,75 @@ const command_t command_t::supported    {};
 const command_t command_t::withLinkMode { .hasLinkMode = true };
 
 const auto pipCommands = make_map_from_groups<command_t>({
-    { command_t::withLinkMode,
-        { L"install" } },
-    { command_t::supported,
-        { L"uninstall", L"freeze", L"list", L"show", L"check" } },
-    { command_t::unsupported,
-        { L"download", // https://github.com/astral-sh/uv/issues/3163
-          L"wheel"     // https://github.com/astral-sh/uv/issues/1681
-        } },
+    { command_t::withLinkMode, {
+        L"install",
+    }},
+    { command_t::supported, {
+        L"uninstall", L"freeze", L"list", L"show", L"check",
+    }},
+    { command_t::unsupported, {
+        L"download", // https://github.com/astral-sh/uv/issues/3163
+        L"wheel"     // https://github.com/astral-sh/uv/issues/1681
+    }},
 });
 
 const auto pipOptions = make_map_from_groups<option_t>({
-    { option_t::skip,
-        { L"--no-cache-dir" } },
-    { option_t::skipWithArg,
-        { L"--cache-dir", L"--python" } },
-    { option_t::withArg,
-        { // general
-          L"--log", L"--keyring-provider", L"--proxy", L"--retries", L"--timeout", L"--exists-action",
-          L"--trusted-host", L"--cert", L"--client-cert", L"--use-feature", L"--use-deprecated",
-          // install
-          // TODO: add withArg options for install and other supported commands
-        } },
+    { option_t::skip, {
+        // special handling
+        L"--no-cache-dir",
+    }},
+    { option_t::skipWithArg, {
+        // special handling
+        L"--cache-dir", L"--python",
+    }},
+    { option_t::withArg, {
+        // general
+        L"--log", L"--keyring-provider", L"--proxy", L"--retries", L"--timeout", L"--exists-action",
+        L"--trusted-host", L"--cert", L"--client-cert", L"--use-feature", L"--use-deprecated",
+        // shared
+        L"-r", L"--requirement",
+        // install / download / wheel
+        L"-c", L"--constraint", L"-e", L"--editable", L"-t", L"--target",
+        L"--platform", L"--python-version", L"--implementation", L"--abi", L"--root-user-action",
+        L"--root", L"--prefix", L"--src", L"--upgrade-strategy", L"-C", L"--config-settings",
+        L"--global-option", L"--no-binary", L"--only-binary", L"--progress-bar",
+        L"--report", L"-i", L"--index-url", L"--extra-index-url", L"-f", L"--find-links",
+        // uninstall - none
+        // freeze / list
+        L"--path", L"--format", L"--exclude",
+        // wheel
+        L"-w", L"--wheel-dir", L"--build-option",
+        // show - none
+        // check - none
+    }},
 });
 
 const auto venvOptions = make_map_from_groups<option_t>({
-    { option_t::skip,
-        { L"--clear", L"--upgrade", L"--upgrade-deps", L"--symlinks", L"--copies", L"--without-pip" } },
-    { option_t::withArg,
-        { L"--prompt" } },
+    { option_t::skip, {
+        // unsupported
+        L"--clear", L"--upgrade", L"--upgrade-deps",
+        // special handling
+        L"--symlinks", L"--copies", L"--without-pip",
+    }},
+    { option_t::withArg, {
+        L"--prompt",
+    }},
 });
 
 const auto virtualenvOptions = make_map_from_groups<option_t>({
-    { option_t::skip,
-        { L"--clear", L"--no-vcs-ignore", L"--no-download", L"--never-download", L"--symlinks", L"--copies", L"--no-seed", L"--without-pip" } },
-    { option_t::skipWithArg,
-        { L"--seeder", L"--creator", L"--activators" } },
-    { option_t::withArg,
-        { L"--prompt", L"--python", L"-p" } },
+    { option_t::skip, {
+        // unsupported
+        L"--clear", L"--no-vcs-ignore", L"--no-download", L"--never-download",
+        // special handling
+        L"--symlinks", L"--copies", L"--no-seed", L"--without-pip",
+    }},
+    { option_t::skipWithArg, {
+        // unsupported
+        L"--seeder", L"--creator", L"--activators",
+    }},
+    { option_t::withArg, {
+        L"--prompt", L"--python", L"-p",
+    }},
 });
 
 enum class command_name_t {
