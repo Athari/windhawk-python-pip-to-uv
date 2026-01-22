@@ -465,7 +465,8 @@ HRESULT translateVenvArgs(const unordered_map<wstring, option_t>& options,
         } else {
             if (envDir.empty())
                 envDir = arg;
-            otherArgs.emplace_back(arg);
+            else if (settings.logLevel >= log_level_t::warn)
+                Wh_Log(L"Multiple venv directories not supported, positional argument '%s' ignored", arg);
         }
     }
 

@@ -5,7 +5,9 @@ $env:PATH = "$PythonPath;$PythonPath\Scripts;$env:PATH"
 $env:PYTHONUTF8 = "1"
 $ErrorActionPreference = 'Stop'
 
-Push-Location (Join-Path (Split-Path $MyInvocation.MyCommand.Path) "out")
+$outDir = Join-Path (Split-Path $MyInvocation.MyCommand.Path) "out"
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+Push-Location $outDir
 
 try {
     $sep = "`n`n------`n`n"
