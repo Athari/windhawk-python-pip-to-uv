@@ -36,7 +36,7 @@ The primary purpose of this mod is to enforce uv's caching and performance onto 
 
 The mod *does not* handle `pip` any better than `uv` — it just blindly replaces arguments, as long as the `uv pip` subcommand is supported. Unsupported subcommands fall back to running `pip`. Notably, these include `download` and `wheel`, which haven't been implemented in `uv` yet.
 
-Translation of `venv` and `virtualenv` to `uv venv` is more precise — the mod skips all unsupported options.
+Translation of `venv` and `virtualenv` to `uv venv` is more precise — the mod skips all unsupported options. Arguments of `virtualenv` specifying custom python interpreter are currently ignored; the current python executable is used in all cases.
 
 The mod restricts smart handling of python versions uv with `--no-python-downloads` and `--python-preference only-system` arguments to reflect how pre-uv commands function.
 
@@ -313,14 +313,17 @@ const auto virtualenvOptions = make_map_from_groups<option_t>({
         // unsupported
         L"--clear", L"--no-vcs-ignore", L"--no-download", L"--never-download",
         // special handling
-        L"--symlinks", L"--copies", L"--no-seed", L"--without-pip",
+        L"--symlinks", L"--copies", L"--no-seed", L"--without-pip", L"--extra-search-dir",
     }},
     { option_t::skipWithArg, {
         // unsupported
         L"--seeder", L"--creator", L"--activators",
+        L"--pip", L"--setuptools", L"--wheel",
+        // ignored
+        L"-p", L"--python", L"--discovery", L"--try-first-with",
     }},
     { option_t::withArg, {
-        L"--prompt", L"--python", L"-p",
+        L"--prompt",
     }},
 });
 
@@ -452,6 +455,8 @@ HRESULT translateVenvArgs(const unordered_map<wstring, option_t>& options,
             linkMode = L"copy";
         } else if (wcsequals(arg, L"--no-seed") || wcsequals(arg, L"--without-pip")) {
             hasSeed = false;
+        } else if (wcsequals(arg, L"--extra-search-dir") && hasNextArg) {
+            otherArgs.append_range(array { L"--find-links", args[iArg + 1] });
         } else if (opt.isSkipped) {
             if (opt.hasArg)
                 iArg++;
