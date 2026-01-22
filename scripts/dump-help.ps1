@@ -1,7 +1,13 @@
-$PythonVersion = 312
-$PythonPath = "C:\Apps\Python\Python$PythonVersion"
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingCmdletAliases', '')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '')]
+param()
 
-$env:PATH = "$PythonPath;$PythonPath\Scripts;$env:PATH"
+$PythonVersion = 312
+$pythonPath = $env:PYTHON_PATH ??
+    ($pythonExe = Get-Command python -ErrorAction SilentlyContinue) ? (Split-Path $pythonExe.Source) :
+    "C:\Apps\Python\Python$PythonVersion"
+
+$env:PATH = "$pythonPath;$pythonPath\Scripts;$env:PATH"
 $env:PYTHONUTF8 = "1"
 $ErrorActionPreference = 'Stop'
 
