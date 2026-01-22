@@ -112,6 +112,7 @@ The mod restricts smart handling of python versions uv with `--no-python-downloa
 #include <cwchar>
 #include <format>
 #include <initializer_list>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -135,13 +136,13 @@ The mod restricts smart handling of python versions uv with `--no-python-downloa
 
 using namespace std;
 using namespace wil;
+namespace rec = std::regex_constants;
 
 const size_t MAX_LOG_STR = 160;
 
 // MARK: utils.h
 
-wstring string_to_wstring(const string& s, UINT cp = CP_ACP)
-{
+wstring string_to_wstring(const string& s, UINT cp = CP_ACP) {
     if (s.empty())
         return L"";
     int len = MultiByteToWideChar(cp, 0, s.c_str(), s.size(), nullptr, 0);
@@ -200,8 +201,7 @@ HRESULT CommandLineToArgvW(LPCWSTR lpCmdLine, unique_hlocal_array_ptr<LPCWSTR>& 
 }
 
 template<typename string_type, size_t length = MAX_PATH>
-HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, string_type& result) WI_NOEXCEPT
-{
+HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, string_type& result) WI_NOEXCEPT {
     wstring expandedName;
     RETURN_IF_FAILED((ExpandEnvironmentStringsW<string_type, length>(fileName, expandedName)));
     const HRESULT searchResult = (SearchPathW<string_type, length>(path, expandedName.c_str(), extension, result));
@@ -212,13 +212,14 @@ HRESULT ExpandEnvAndSearchPathW(PCWSTR path, PCWSTR fileName, PCWSTR extension, 
 
 // MARK: options.h
 
+const auto reExeWithVersion = wregex(LR"(^(python|pip|venv|virtualenv)[\.\d]*\.exe$)", rec::icase);
+
 template<typename T>
 unordered_map<wstring, T>
-make_map_from_groups(initializer_list<pair<T, initializer_list<wstring>>> groups)
-{
+make_map_from_groups(initializer_list<pair<T, initializer_list<wstring>>> groups) {
     unordered_map<wstring, T> m;
-    for (auto const &group : groups)
-        for (auto const &key : group.second)
+    for (const auto& group : groups)
+        for (const auto& key : group.second)
             m.emplace(key, group.first);
     return m;
 }
@@ -593,19 +594,24 @@ BOOL WINAPI CreateProcessW_Hook(
 
         wstring pythonPath;
         wstring scriptsDir;
-        if ((wcsistarts(exeName, L"pip") || wcsistarts(exeName, L"virtualenv")) && wcsiends(exeName, L".exe")) {
+        wcmatch exeMatch;
+        if (!regex_match(exeName, exeMatch, reExeWithVersion))
+            return bypass(L"unknown executable");
+
+        auto exeBaseName = exeMatch[1].str();
+        if (!wcsiequals(exeBaseName.c_str(), L"python")) {
             scriptsDir = PathGetDirNameW(exePath.c_str());
             auto pythonSearchPath = PathGetDirNameW(scriptsDir.c_str()) + L";" + searchPath;
             if (FAILED(SearchPathW(pythonSearchPath.c_str(), L"python.exe", nullptr, pythonPath)))
                 return bypass(format(L"SearchPathW({}) failed", L"python").c_str());
 
-            if (wcsistarts(exeName, L"pip"))
+            if (wcsiequals(exeBaseName.c_str(), L"pip"))
                 SET_COMMAND_NAME(replacePip, pip); // ... pip.exe ...
-            else if (wcsistarts(exeName, L"virtualenv"))
+            else if (wcsiequals(exeBaseName.c_str(), L"virtualenv"))
                 SET_COMMAND_NAME(replaceVirtualEnv, virtualenv); // ... virtualenv.exe ...
             else
                 return bypass(L"unknown module.exe");
-        } else if (wcsistarts(exeName, L"python")) {
+        } else {
             pythonPath = exePath;
             auto pythonDir = PathGetDirNameW(pythonPath.c_str());
             scriptsDir = pythonDir + L"\\Scripts";
@@ -626,9 +632,14 @@ BOOL WINAPI CreateProcessW_Hook(
                     return bypass(format(L"SearchPathW({}) failed", args[iArg]).c_str());
 
                 auto scriptName = PathFindFileNameW(scriptPath.c_str());
-                if (wcsistarts(scriptName, L"pip") && wcsiends(scriptName, L".exe"))
+                wcmatch striptMatch;
+                if (!regex_match(scriptName, striptMatch, reExeWithVersion))
+                    return bypass(L"unknown script executable");
+
+                auto scriptBaseName = striptMatch[1].str();
+                if (wcsiequals(scriptBaseName.c_str(), L"pip"))
                     SET_COMMAND_NAME(replacePip, pip); // ... python.exe scripts/pip.exe ...
-                else if (wcsistarts(scriptName, L"virtualenv") && wcsiends(scriptName, L".exe"))
+                else if (wcsiequals(scriptBaseName.c_str(), L"virtualenv"))
                     SET_COMMAND_NAME(replaceVirtualEnv, virtualenv); // ... python.exe scripts/virtualenv.exe ...
                 else
                     return bypass(L"unknown python module.exe");
